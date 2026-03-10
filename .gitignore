@@ -1,0 +1,21 @@
+.DS_Store
+
+# Local environment and secrets
+.env
+.env.*
+
+# Local agent/editor state
+.claude/
+.mica/
+
+# Build artifacts
+/mica
+/mica-echo
+*.exe
+
+# Test and coverage output
+/coverage.out
+*.coverprofile
+
+# Go workspace noise
+bin/
