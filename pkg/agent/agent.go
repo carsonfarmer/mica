@@ -1,271 +1,204 @@
-// Package agent provides the ACP protocol adapter layer.
+// Package agent wires the ACP protocol, the LLM bridge, and storage together
+// into a fully functional ACP agent.
 package agent
 
 import (
 	"context"
-	"errors"
-	"os"
 	"sync"
 
-	acp "github.com/coder/acp-go-sdk"
-
-	"github.com/carsonfarmer/mica/internal/app"
-	"github.com/carsonfarmer/mica/pkg/session"
+	"charm.land/fantasy"
+	acp "github.com/carsonfarmer/go-acp-sdk"
+	"github.com/carsonfarmer/go-acp-sdk/agentutil"
+	"github.com/carsonfarmer/go-acp-sdk/storage"
+	"github.com/carsonfarmer/mica/pkg/llm"
 )
 
-const (
-	updateChunkSize = 100
-)
+// AgentSession is the persisted session type. It embeds *acp.SessionInfo for
+// protocol fields and adds Model for LLM selection.
+type AgentSession struct {
+	*acp.SessionInfo
+	Model string `json:"model"`
+}
 
-// Agent implements the ACP agent interfaces for the Phase 1 echo scaffold.
+// Agent implements acp.Agent and optional session lifecycle interfaces.
 type Agent struct {
-	conn *acp.AgentSideConnection
-	logs *session.Logs
-
-	mu      sync.Mutex
-	cancels map[acp.SessionId]context.CancelFunc
+	reg        *llm.Registry
+	store      storage.Store[*AgentSession]
+	bc         *agentutil.SessionBroadcaster
+	name       string
+	tools      []fantasy.AgentTool
+	cancellers map[acp.SessionID]*agentutil.SessionCanceller
+	mu         sync.Mutex
 }
 
-// New constructs an Agent over the session owner.
-func New(logs *session.Logs) *Agent {
-	return &Agent{
-		logs:    logs,
-		cancels: make(map[acp.SessionId]context.CancelFunc),
+// Option configures an Agent.
+type Option func(*Agent)
+
+// WithName sets the agent name reported in Initialize responses.
+func WithName(name string) Option {
+	return func(a *Agent) { a.name = name }
+}
+
+// WithTools sets the agent's tool set.
+func WithTools(tools ...fantasy.AgentTool) Option {
+	return func(a *Agent) { a.tools = tools }
+}
+
+// New creates a new Agent.
+func New(reg *llm.Registry, store storage.Store[*AgentSession], opts ...Option) *Agent {
+	a := &Agent{
+		reg:        reg,
+		store:      store,
+		bc:         agentutil.NewSessionBroadcaster(),
+		name:       "mica",
+		cancellers: make(map[acp.SessionID]*agentutil.SessionCanceller),
 	}
+	for _, o := range opts {
+		o(a)
+	}
+	return a
 }
 
-// SetAgentConnection implements acp.AgentConnAware.
-func (a *Agent) SetAgentConnection(conn *acp.AgentSideConnection) {
-	a.conn = conn
-}
+// ACP interface methods
 
-// Authenticate implements acp.Agent.
-func (a *Agent) Authenticate(ctx context.Context, req acp.AuthenticateRequest) (acp.AuthenticateResponse, error) {
-	return acp.AuthenticateResponse{}, nil
-}
-
-// Initialize implements acp.Agent.
-func (a *Agent) Initialize(ctx context.Context, req acp.InitializeRequest) (acp.InitializeResponse, error) {
-	return acp.InitializeResponse{
-		AgentInfo: &acp.Implementation{
-			Name:    app.AgentName,
-			Title:   acp.Ptr(app.AgentTitle),
-			Version: app.Version,
-		},
-		AgentCapabilities: acp.AgentCapabilities{
+func (a *Agent) Initialize(_ context.Context, req *acp.InitializeRequest) (*acp.InitializeResponse, error) {
+	return &acp.InitializeResponse{
+		ProtocolVersion: 1,
+		AgentCapabilities: &acp.AgentCapabilities{
 			LoadSession: true,
+			PromptCapabilities: acp.PromptCapabilities{
+				Image:           true,
+				EmbeddedContext: true,
+			},
 			SessionCapabilities: acp.SessionCapabilities{
-				Fork:   &acp.SessionForkCapabilities{},
 				List:   &acp.SessionListCapabilities{},
 				Resume: &acp.SessionResumeCapabilities{},
+				Fork:   &acp.SessionForkCapabilities{},
 			},
 		},
-		AuthMethods:     []acp.AuthMethod{},
-		ProtocolVersion: acp.ProtocolVersionNumber,
+		AgentInfo: &acp.Implementation{Name: a.name, Version: "0.1.0"},
 	}, nil
 }
 
-// NewSession implements acp.Agent.
-func (a *Agent) NewSession(ctx context.Context, req acp.NewSessionRequest) (acp.NewSessionResponse, error) {
-	log, err := a.logs.Create(newSessionHeader(req))
-	if err != nil {
-		return acp.NewSessionResponse{}, err
-	}
-	return newSessionResponse(log), nil
+func (a *Agent) Authenticate(_ context.Context, _ *acp.AuthenticateRequest) (*acp.AuthenticateResponse, error) {
+	return &acp.AuthenticateResponse{}, nil
 }
 
-// Prompt implements acp.Agent.
-func (a *Agent) Prompt(ctx context.Context, req acp.PromptRequest) (acp.PromptResponse, error) {
-	log, err := a.getLog(req.SessionId)
+func (a *Agent) NewSession(ctx context.Context, req *acp.NewSessionRequest, client acp.Client) (*acp.NewSessionResponse, error) {
+	sid := acp.SessionID(acp.NewUUID())
+
+	if err := a.store.Set(ctx, sid, &AgentSession{
+		SessionInfo: &acp.SessionInfo{SessionID: sid, CWD: req.CWD},
+		Model:       a.reg.Default(),
+	}); err != nil {
+		return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
+	}
+
+	a.bc.Subscribe(sid, client)
+
+	return &acp.NewSessionResponse{SessionID: sid}, nil
+}
+
+func (a *Agent) LoadSession(ctx context.Context, req *acp.LoadSessionRequest, client acp.Client) (*acp.LoadSessionResponse, error) {
+	a.bc.Subscribe(req.SessionID, client)
+
+	events, err := a.store.Load(ctx, req.SessionID)
 	if err != nil {
-		return acp.PromptResponse{}, err
+		return nil, err
+	}
+	if len(events) == 0 {
+		return &acp.LoadSessionResponse{}, nil
 	}
 
-	promptCtx, cancel := context.WithCancel(ctx)
-	a.setCancel(req.SessionId, cancel)
-	defer a.clearCancel(req.SessionId)
-
-	promptText := flattenPrompt(req.Prompt)
-	if err := a.appendAndNotify(ctx, req.SessionId, log, sessionInfoUpdate(log, promptText)); err != nil {
-		return acp.PromptResponse{}, err
-	}
-	userUpdate := acp.UpdateUserMessageText(promptText)
-	if err := a.appendAndNotify(ctx, req.SessionId, log, userUpdate); err != nil {
-		return acp.PromptResponse{}, err
-	}
-
-	state := configStateFromLog(log)
-	responseText := state.formatResponse(promptText)
-
-	for _, chunk := range splitIntoChunks(responseText, updateChunkSize) {
-		select {
-		case <-promptCtx.Done():
-			return acp.PromptResponse{StopReason: acp.StopReasonCancelled}, nil
-		default:
-		}
-
-		update := acp.UpdateAgentMessageText(chunk)
-		if err := a.appendAndNotify(ctx, req.SessionId, log, update); err != nil {
-			return acp.PromptResponse{}, err
+	stream := agentutil.NewSessionStream(client, req.SessionID)
+	for _, upd := range events {
+		if err := stream.SendUpdate(ctx, upd); err != nil {
+			return nil, err
 		}
 	}
 
-	return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
+	return &acp.LoadSessionResponse{}, nil
 }
 
-// Cancel implements acp.Agent.
-func (a *Agent) Cancel(ctx context.Context, req acp.CancelNotification) error {
+func (a *Agent) CloseSession(_ context.Context, req *acp.CloseSessionRequest, client acp.Client) (*acp.CloseSessionResponse, error) {
+	a.bc.Unsubscribe(req.SessionID, client)
+
 	a.mu.Lock()
-	cancel := a.cancels[req.SessionId]
-	delete(a.cancels, req.SessionId)
-	a.mu.Unlock()
-	if cancel != nil {
-		cancel()
+	defer a.mu.Unlock()
+	if c, ok := a.cancellers[req.SessionID]; ok {
+		c.End()
+		delete(a.cancellers, req.SessionID)
+	}
+
+	return &acp.CloseSessionResponse{}, nil
+}
+
+func (a *Agent) Cancel(_ context.Context, notif *acp.CancelNotification) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if c, ok := a.cancellers[notif.SessionID]; ok {
+		c.Cancel()
 	}
 	return nil
 }
 
-// SetSessionConfigOption implements acp.Agent.
-func (a *Agent) SetSessionConfigOption(ctx context.Context, req acp.SetSessionConfigOptionRequest) (acp.SetSessionConfigOptionResponse, error) {
-	log, err := a.getLog(req.SessionId)
+func (a *Agent) ListSessions(ctx context.Context, _ *acp.ListSessionsRequest) (*acp.ListSessionsResponse, error) {
+	sessions, err := a.store.List(ctx)
 	if err != nil {
-		return acp.SetSessionConfigOptionResponse{}, err
-	}
-
-	state, modeChanged, err := applyConfigRequest(configStateFromLog(log), req)
-	if err != nil {
-		return acp.SetSessionConfigOptionResponse{}, err
-	}
-
-	options := configOptions(state)
-	configUpdate := acp.SessionUpdate{
-		ConfigOptionUpdate: &acp.SessionConfigOptionUpdate{
-			ConfigOptions: options,
-		},
-	}
-	if err := a.appendAndNotify(ctx, req.SessionId, log, configUpdate); err != nil {
-		return acp.SetSessionConfigOptionResponse{}, err
-	}
-
-	if modeChanged {
-		modeUpdate := acp.SessionUpdate{
-			CurrentModeUpdate: &acp.SessionCurrentModeUpdate{
-				CurrentModeId: state.ModeID,
-			},
-		}
-		if err := a.appendAndNotify(ctx, req.SessionId, log, modeUpdate); err != nil {
-			return acp.SetSessionConfigOptionResponse{}, err
-		}
-	}
-
-	return acp.SetSessionConfigOptionResponse{ConfigOptions: options}, nil
-}
-
-// SetSessionMode implements acp.Agent.
-func (a *Agent) SetSessionMode(ctx context.Context, req acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
-	return acp.SetSessionModeResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionSetMode)
-}
-
-// LoadSession implements acp.AgentLoader.
-func (a *Agent) LoadSession(ctx context.Context, req acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
-	log, err := a.loadLog(req.Cwd, req.SessionId)
-	if err != nil {
-		return acp.LoadSessionResponse{}, err
-	}
-	for _, update := range log.Updates() {
-		if err := a.notify(ctx, req.SessionId, update); err != nil {
-			return acp.LoadSessionResponse{}, err
-		}
-	}
-	return loadSessionResponse(log), nil
-}
-
-// UnstableForkSession implements acp.AgentExperimental.
-func (a *Agent) UnstableForkSession(ctx context.Context, req acp.UnstableForkSessionRequest) (acp.UnstableForkSessionResponse, error) {
-	parent, err := a.loadLog(req.Cwd, req.SessionId)
-	if err != nil {
-		return acp.UnstableForkSessionResponse{}, err
-	}
-	state := configStateFromLog(parent)
-
-	child, err := a.logs.Fork(req.Cwd, req.SessionId, forkSessionHeader(req, state, parent.Modes()))
-	if err != nil {
-		return acp.UnstableForkSessionResponse{}, err
-	}
-	return forkSessionResponse(child), nil
-}
-
-// UnstableListSessions implements acp.AgentExperimental.
-func (a *Agent) UnstableListSessions(ctx context.Context, req acp.UnstableListSessionsRequest) (acp.UnstableListSessionsResponse, error) {
-	cwd, err := listCWD(req.Cwd)
-	if err != nil {
-		return acp.UnstableListSessionsResponse{}, err
-	}
-	sessions, err := a.logs.List(cwd)
-	if err != nil {
-		return acp.UnstableListSessionsResponse{}, err
-	}
-	return acp.UnstableListSessionsResponse{Sessions: sessions}, nil
-}
-
-// UnstableResumeSession implements acp.AgentExperimental.
-func (a *Agent) UnstableResumeSession(ctx context.Context, req acp.UnstableResumeSessionRequest) (acp.UnstableResumeSessionResponse, error) {
-	log, err := a.loadLog(req.Cwd, req.SessionId)
-	if err != nil {
-		return acp.UnstableResumeSessionResponse{}, err
-	}
-	return resumeSessionResponse(log), nil
-}
-
-// UnstableSetSessionModel implements acp.AgentExperimental.
-func (a *Agent) UnstableSetSessionModel(ctx context.Context, req acp.UnstableSetSessionModelRequest) (acp.UnstableSetSessionModelResponse, error) {
-	return acp.UnstableSetSessionModelResponse{}, acp.NewMethodNotFound(acp.AgentMethodSessionSetModel)
-}
-
-func (a *Agent) getLog(sessionID acp.SessionId) (*session.Log, error) {
-	log, ok := a.logs.Get(sessionID)
-	if !ok {
-		return nil, acp.NewInvalidParams(map[string]string{"sessionId": string(sessionID)})
-	}
-	return log, nil
-}
-
-func (a *Agent) loadLog(cwd string, sessionID acp.SessionId) (*session.Log, error) {
-	log, err := a.logs.Load(cwd, sessionID)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, acp.NewInvalidParams(map[string]string{"sessionId": string(sessionID)})
-		}
 		return nil, err
 	}
-	return log, nil
-}
-
-func (a *Agent) appendAndNotify(ctx context.Context, sessionID acp.SessionId, log *session.Log, update acp.SessionUpdate) error {
-	if err := log.Append(update); err != nil {
-		return err
+	infos := make([]acp.SessionInfo, 0, len(sessions))
+	for _, s := range sessions {
+		infos = append(infos, *s.SessionInfo)
 	}
-	return a.notify(ctx, sessionID, update)
+	return &acp.ListSessionsResponse{Sessions: infos}, nil
 }
 
-func (a *Agent) notify(ctx context.Context, sessionID acp.SessionId, update acp.SessionUpdate) error {
-	if a.conn == nil {
-		return nil
+func (a *Agent) ResumeSession(ctx context.Context, req *acp.ResumeSessionRequest, client acp.Client) (*acp.ResumeSessionResponse, error) {
+	a.bc.Subscribe(req.SessionID, client)
+	if _, err := a.store.Get(ctx, req.SessionID); err != nil {
+		return nil, err
 	}
-	return a.conn.SessionUpdate(ctx, acp.SessionNotification{
-		SessionId: sessionID,
-		Update:    update,
-	})
+	return &acp.ResumeSessionResponse{}, nil
 }
 
-func (a *Agent) setCancel(sessionID acp.SessionId, cancel context.CancelFunc) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.cancels[sessionID] = cancel
+func (a *Agent) ForkSession(ctx context.Context, req *acp.ForkSessionRequest, client acp.Client) (*acp.ForkSessionResponse, error) {
+	parent, err := a.store.Get(ctx, req.SessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	head, err := a.store.Head(ctx, req.SessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	sid := acp.SessionID(acp.NewUUID())
+
+	if err := a.store.Set(ctx, sid, &AgentSession{
+		SessionInfo: &acp.SessionInfo{SessionID: sid, CWD: parent.CWD},
+		Model:       parent.Model,
+	}); err != nil {
+		return nil, err
+	}
+
+	if head != nil {
+		if err := a.store.Commit(ctx, sid, *head); err != nil {
+			return nil, err
+		}
+	}
+
+	a.bc.Subscribe(sid, client)
+
+	return &acp.ForkSessionResponse{SessionID: sid}, nil
 }
 
-func (a *Agent) clearCancel(sessionID acp.SessionId) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	delete(a.cancels, sessionID)
-}
+// Interface checks.
+var (
+	_ acp.Agent               = (*Agent)(nil)
+	_ acp.AgentSessionLoader  = (*Agent)(nil)
+	_ acp.AgentSessionCloser  = (*Agent)(nil)
+	_ acp.AgentSessionLister  = (*Agent)(nil)
+	_ acp.AgentSessionResumer = (*Agent)(nil)
+	_ acp.AgentSessionForker  = (*Agent)(nil)
+)

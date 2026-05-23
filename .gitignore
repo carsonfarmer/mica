@@ -1,21 +1,19 @@
-.DS_Store
-
-# Local environment and secrets
-.env
-.env.*
-
-# Local agent/editor state
-.claude/
-.mica/
-
-# Build artifacts
-/mica
-/mica-echo
-*.exe
-
-# Test and coverage output
-/coverage.out
-*.coverprofile
-
-# Go workspace noise
+# Binaries
 bin/
+mica
+*.exe
+*.test
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Mica runtime data
+.mica/
