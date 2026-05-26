@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"time"
 
+	"charm.land/catwalk/pkg/catwalk"
 	"charm.land/fantasy"
+	"charm.land/fantasy/providers/openai"
 	"charm.land/fantasy/providers/openaicompat"
 	acp "github.com/carsonfarmer/go-acp-sdk"
 	"github.com/carsonfarmer/go-acp-sdk/agentutil"
@@ -13,26 +15,13 @@ import (
 )
 
 func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.Client) (*acp.PromptResponse, error) {
-	sess, err := a.store.Get(ctx, req.SessionID)
+	sess, head, err := a.store.Get(ctx, req.SessionID)
 	if err != nil {
 		return nil, acp.NewRPCError(acp.ErrInvalidParams, "session not found")
 	}
-	if sess.Model == "" {
-		return nil, acp.NewRPCError(acp.ErrInvalidParams, "no model configured")
-	}
 
-	var canceller agentutil.SessionCanceller
-	a.mu.Lock()
-	a.cancellers[req.SessionID] = &canceller
-	a.mu.Unlock()
-
-	ctx = canceller.Begin(ctx)
-	defer func() {
-		canceller.End()
-		a.mu.Lock()
-		delete(a.cancellers, req.SessionID)
-		a.mu.Unlock()
-	}()
+	ctx = a.cancellers.Begin(ctx, req.SessionID)
+	defer a.cancellers.End(req.SessionID)
 
 	ctx = llm.WithClient(ctx, client)
 	ctx = llm.WithSession(ctx, req.SessionID)
@@ -52,19 +41,34 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 		return nil, acp.NewRPCError(acp.ErrInvalidParams, "empty prompt")
 	}
 
-	prevEvents, _ := a.store.Load(ctx, req.SessionID)
-	history := llm.HistoryToMessages(prevEvents)
+	prevEvents, err := a.store.Load(ctx, req.SessionID)
+	if err != nil {
+		return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
+	}
+	history := llm.UpdatesToMessages(prevEvents)
 	history = append(history, userMsg)
+
+	// Persist user message directly from the prompt blocks.
+	for _, b := range req.Prompt {
+		upd := acp.UpdateUserMessage(b, userMsgID)
+		if head, err = a.store.Append(ctx, req.SessionID, upd, head); err != nil {
+			return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
+		}
+	}
 
 	stream := agentutil.NewSessionStream(a.bc, req.SessionID)
 
-	fa := fantasy.NewAgent(model, fantasy.WithTools(a.tools...))
+	agentOpts := []fantasy.AgentOption{fantasy.WithTools(a.tools...)}
+	if cfg, ok := a.reg.Config(sess.Model); ok && cfg.DefaultMaxTokens > 0 {
+		agentOpts = append(agentOpts, fantasy.WithMaxOutputTokens(cfg.DefaultMaxTokens))
+	}
+	fa := fantasy.NewAgent(model, agentOpts...)
 
 	call := fantasy.AgentStreamCall{
 		Messages: history,
 		ProviderOptions: fantasy.ProviderOptions{
 			openaicompat.TypeProviderOptions: &openaicompat.ProviderOptions{
-				ExtraBody: map[string]any{"reasoning": true},
+				ReasoningEffort: openai.ReasoningEffortOption(openai.ReasoningEffort(sess.ThoughtLevel)),
 			},
 		},
 		OnTextDelta: func(id, text string) error {
@@ -74,16 +78,32 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 			return stream.SendThought(ctx, text, id)
 		},
 		OnToolCall: func(tc fantasy.ToolCallContent) error {
-			return stream.StartToolCall(ctx, tc.ToolCallID, tc.ToolName, llm.ToolNameToACP(tc.ToolName))
+			title := llm.TitleForTool(tc.ToolName, string(tc.Input), sess.CWD)
+			kind := llm.ToolNameToACP(tc.ToolName)
+			upd := acp.UpdateToolCallStart(acp.ToolCallID(tc.ToolCallID), title)
+			upd.ToolCall.Kind = new(acp.ToolKind)
+			*upd.ToolCall.Kind = kind
+			status := acp.ToolInProgress
+			upd.ToolCall.Status = &status
+			upd.ToolCall.RawInput = json.RawMessage(tc.Input)
+			return stream.SendUpdate(ctx, upd)
 		},
 		OnToolResult: func(tr fantasy.ToolResultContent) error {
-			switch tr.Result.(type) {
+			status := acp.ToolCompleted
+			var text string
+			switch o := tr.Result.(type) {
+			case fantasy.ToolResultOutputContentText:
+				text = o.Text
 			case fantasy.ToolResultOutputContentError:
-				return stream.FailToolCall(ctx, tr.ToolCallID)
-			default:
-				raw, _ := json.Marshal(tr.Result)
-				return stream.CompleteToolCall(ctx, tr.ToolCallID, acp.ToolContent(acp.TextBlock(string(raw))))
+				status = acp.ToolFailed
+				if o.Error != nil {
+					text = o.Error.Error()
+				}
 			}
+			upd := acp.UpdateToolCallDelta(tr.ToolCallID)
+			upd.ToolCallUpdate.Status = &status
+			upd.ToolCallUpdate.RawOutput = text
+			return stream.SendUpdate(ctx, upd)
 		},
 	}
 
@@ -95,27 +115,18 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 		return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
 	}
 
-	// Persist user updates and results.
-	head, err := a.store.Head(ctx, req.SessionID)
-	if err != nil {
-		return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
-	}
-	for _, upd := range llm.MessageToACP(userMsg) {
-		upd.UserMessageChunk.MessageID = userMsgID
-		head, err = a.store.Append(ctx, req.SessionID, upd, head)
-		if err != nil {
-			return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
-		}
-	}
-
 	for _, step := range result.Steps {
 		for _, msg := range step.Messages {
 			for _, upd := range llm.MessageToACP(msg) {
-				head, err = a.store.Append(ctx, req.SessionID, upd, head)
-				if err != nil {
+				// Enrich tool call titles using the exported helper.
+				if upd.ToolCall != nil {
+					input, _ := json.Marshal(upd.ToolCall.RawInput)
+					title := llm.TitleForTool(string(upd.ToolCall.Title), string(input), sess.CWD)
+					upd.ToolCall.Title = title
+				}
+				if head, err = a.store.Append(ctx, req.SessionID, upd, head); err != nil {
 					return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
 				}
-				stream.SendUpdate(ctx, upd)
 			}
 		}
 	}
@@ -124,24 +135,25 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 	usage := llm.UsageToACP(result.Response.Usage)
 
 	if len(req.Prompt) > 0 {
-		sess.SessionInfo.Title = acp.TitleFromPrompt(req.Prompt)
+		sess.SessionInfo.Title = agentutil.TitleFromPrompt(req.Prompt)
 	}
 	if sess.SessionInfo.Title != "" {
+		a.store.Set(ctx, req.SessionID, sess)
 		upd := acp.UpdateSessionInfo(sess.SessionInfo.Title, time.Now())
-		head, err = a.store.Append(ctx, req.SessionID, upd, head)
-		if err != nil {
+		if head, err = a.store.Append(ctx, req.SessionID, upd, head); err != nil {
 			return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
 		}
-		stream.SendUpdate(ctx, upd)
+		stream.SendSessionInfo(ctx, sess.SessionInfo.Title)
 	}
 
 	if usage != nil {
-		upd := acp.UpdateUsage(usage.TotalTokens, 0, nil)
-		head, err = a.store.Append(ctx, req.SessionID, upd, head)
-		if err != nil {
+		cfg, _ := a.reg.Config(sess.Model)
+		cost := computeCost(cfg, usage)
+		upd := acp.UpdateUsage(usage.TotalTokens, 0, cost)
+		if head, err = a.store.Append(ctx, req.SessionID, upd, head); err != nil {
 			return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
 		}
-		stream.SendUpdate(ctx, upd)
+		stream.SendUsageUpdate(ctx, usage.TotalTokens, 0, cost)
 	}
 
 	if head != nil {
@@ -153,4 +165,27 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 		Usage:         usage,
 		UserMessageID: userMsgID,
 	}, nil
+}
+
+func computeCost(cfg catwalk.Model, usage *acp.Usage) *acp.Cost {
+	if usage == nil {
+		return nil
+	}
+	var total float64
+	if cfg.CostPer1MIn > 0 && usage.InputTokens > 0 {
+		total += float64(usage.InputTokens) * cfg.CostPer1MIn / 1e6
+	}
+	if cfg.CostPer1MOut > 0 && usage.OutputTokens > 0 {
+		total += float64(usage.OutputTokens) * cfg.CostPer1MOut / 1e6
+	}
+	if cfg.CostPer1MInCached > 0 && usage.CachedReadTokens != nil && *usage.CachedReadTokens > 0 {
+		total += float64(*usage.CachedReadTokens) * cfg.CostPer1MInCached / 1e6
+	}
+	if cfg.CostPer1MOutCached > 0 && usage.CachedWriteTokens != nil && *usage.CachedWriteTokens > 0 {
+		total += float64(*usage.CachedWriteTokens) * cfg.CostPer1MOutCached / 1e6
+	}
+	if total == 0 {
+		return nil
+	}
+	return &acp.Cost{Amount: total, Currency: "USD"}
 }

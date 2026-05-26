@@ -8,6 +8,13 @@ Never run `git commit` or `git push` unless the user has explicitly instructed
 you to do so in the current turn. A prior instruction to commit does not carry
 forward. If in doubt, ask.
 
+### 0.1. Never discard uncommitted work.
+
+Never run `git checkout -- .`, `git reset --hard`, `git clean -f`, or any
+other command that destroys uncommitted changes. If you break something,
+fix it in code — don't reach for git to undo. Uncommitted changes are the
+only copy of in-progress work.
+
 ## References
 
 - [ACP schema](https://github.com/agentclientprotocol/agent-client-protocol/tree/main/schema) — authoritative JSON Schema definitions for the protocol

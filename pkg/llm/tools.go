@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"charm.land/fantasy"
@@ -24,7 +25,6 @@ const (
 	ToolNamePlan            = "plan"
 )
 
-// Context keys for passing runtime values to tools.
 type ctxKey string
 
 const (
@@ -54,17 +54,68 @@ func SessionFrom(ctx context.Context) acp.SessionID {
 	return s
 }
 
+// ReadFileInput is the input for the read_file tool.
+type ReadFileInput struct {
+	Path  string `json:"path" description:"Absolute path to the file to read"`
+	Line  int    `json:"line,omitempty" description:"Line number to start reading from (1-indexed)"`
+	Limit int    `json:"limit,omitempty" description:"Maximum number of lines to read"`
+}
+
+// WriteFileInput is the input for the write_file tool.
+type WriteFileInput struct {
+	Path    string `json:"path" description:"Absolute path to the file to write"`
+	Content string `json:"content" description:"Content to write to the file"`
+}
+
+// TerminalInput is the input for terminal tools.
+type TerminalInput struct {
+	Command string   `json:"command" description:"The shell command to execute"`
+	Args    []string `json:"args,omitempty" description:"Command arguments"`
+	Cwd     string   `json:"cwd,omitempty" description:"Working directory for the command"`
+}
+
+// TitleForTool returns a human-readable title for a tool call.
+func TitleForTool(name, input string, cwd string) string {
+	switch name {
+	case ToolNameExecuteCommand, ToolNameTerminalCreate:
+		var in TerminalInput
+		if json.Unmarshal([]byte(input), &in) == nil {
+			return strings.TrimSpace(in.Command + " " + strings.Join(in.Args, " "))
+		}
+	case ToolNameReadFile:
+		var in ReadFileInput
+		if json.Unmarshal([]byte(input), &in) == nil {
+			rel, err := filepath.Rel(cwd, in.Path)
+			if err != nil {
+				rel = in.Path
+			}
+			if in.Line > 0 && in.Limit > 0 {
+				return fmt.Sprintf("read %s (lines %d-%d)", rel, in.Line, in.Line+in.Limit)
+			}
+			if in.Line > 0 {
+				return fmt.Sprintf("read %s (starting at line %d)", rel, in.Line)
+			}
+			return "read " + rel
+		}
+	case ToolNameWriteFile:
+		var in WriteFileInput
+		if json.Unmarshal([]byte(input), &in) == nil {
+			rel, err := filepath.Rel(cwd, in.Path)
+			if err != nil {
+				rel = in.Path
+			}
+			return "write " + rel
+		}
+	}
+	return name
+}
+
 // ReadFileTool creates a tool that reads a file via the ACP client.
 func ReadFileTool() fantasy.AgentTool {
-	type input struct {
-		Path  string `json:"path" description:"Absolute path to the file to read"`
-		Line  int    `json:"line,omitempty" description:"Line number to start reading from (1-indexed)"`
-		Limit int    `json:"limit,omitempty" description:"Maximum number of lines to read"`
-	}
 	return fantasy.NewParallelAgentTool(
 		ToolNameReadFile,
 		"Read a file from the local filesystem.",
-		func(ctx context.Context, in input, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
+		func(ctx context.Context, in ReadFileInput, tc fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			resp, err := ClientFrom(ctx).ReadTextFile(ctx, &acp.ReadTextFileRequest{
 				SessionID: SessionFrom(ctx),
 				Path:      in.Path,
@@ -74,45 +125,71 @@ func ReadFileTool() fantasy.AgentTool {
 			if err != nil {
 				return fantasy.NewTextErrorResponse(err.Error()), nil
 			}
-			return fantasy.NewTextResponse(resp.Content), nil
+
+			stream := agentutil.NewSessionStream(ClientFrom(ctx), SessionFrom(ctx))
+			upd := acp.UpdateToolCallDelta(acp.ToolCallID(tc.ID))
+			upd.ToolCallUpdate.Locations = []acp.ToolCallLocation{{Path: in.Path, Line: in.Line}}
+			stream.SendUpdate(ctx, upd)
+
+			r := fantasy.NewTextResponse("```\n" + resp.Content + "\n```")
+			meta, _ := json.Marshal(acp.ToolCallUpdate{
+				Locations: []acp.ToolCallLocation{{Path: in.Path, Line: in.Line}},
+				Content:   []acp.ToolCallContent{acp.ToolContent(acp.TextBlock(resp.Content))},
+			})
+			r.Metadata = string(meta)
+			return r, nil
 		},
 	)
 }
 
 // WriteFileTool creates a tool that writes a file via the ACP client.
 func WriteFileTool() fantasy.AgentTool {
-	type input struct {
-		Path    string `json:"path" description:"Absolute path to the file to write"`
-		Content string `json:"content" description:"Content to write to the file"`
-	}
 	return fantasy.NewParallelAgentTool(
 		ToolNameWriteFile,
 		"Write content to a file on the local filesystem.",
-		func(ctx context.Context, in input, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
-			_, err := ClientFrom(ctx).WriteTextFile(ctx, &acp.WriteTextFileRequest{
-				SessionID: SessionFrom(ctx),
+		func(ctx context.Context, in WriteFileInput, tc fantasy.ToolCall) (fantasy.ToolResponse, error) {
+			client := ClientFrom(ctx)
+			sid := SessionFrom(ctx)
+
+			var oldContent string
+			if resp, err := client.ReadTextFile(ctx, &acp.ReadTextFileRequest{
+				SessionID: sid, Path: in.Path,
+			}); err == nil {
+				oldContent = resp.Content
+			}
+
+			_, err := client.WriteTextFile(ctx, &acp.WriteTextFileRequest{
+				SessionID: sid,
 				Path:      in.Path,
 				Content:   in.Content,
 			})
 			if err != nil {
 				return fantasy.NewTextErrorResponse(err.Error()), nil
 			}
-			return fantasy.NewTextResponse("File written successfully."), nil
+
+			stream := agentutil.NewSessionStream(client, sid)
+			upd := acp.UpdateToolCallDelta(acp.ToolCallID(tc.ID))
+			upd.ToolCallUpdate.Locations = []acp.ToolCallLocation{{Path: in.Path}}
+			upd.ToolCallUpdate.Content = []acp.ToolCallContent{acp.ToolDiff(in.Path, in.Content, oldContent)}
+			stream.SendUpdate(ctx, upd)
+
+			r := fantasy.NewTextResponse("File written successfully.")
+			meta, _ := json.Marshal(acp.ToolCallUpdate{
+				Locations: []acp.ToolCallLocation{{Path: in.Path}},
+				Content:   []acp.ToolCallContent{acp.ToolDiff(in.Path, in.Content, oldContent)},
+			})
+			r.Metadata = string(meta)
+			return r, nil
 		},
 	)
 }
 
-// TerminalTool creates a combined terminal tool that handles full lifecycle.
+// TerminalTool creates a combined terminal tool.
 func TerminalTool() fantasy.AgentTool {
-	type input struct {
-		Command string   `json:"command" description:"The shell command to execute"`
-		Args    []string `json:"args,omitempty" description:"Command arguments"`
-		Cwd     string   `json:"cwd,omitempty" description:"Working directory for the command"`
-	}
 	return fantasy.NewAgentTool(
 		ToolNameExecuteCommand,
 		"Execute a shell command on the local system.",
-		func(ctx context.Context, in input, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
+		func(ctx context.Context, in TerminalInput, tc fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			client := ClientFrom(ctx)
 			terminal, ok := client.(acp.ClientTerminal)
 			if !ok {
@@ -129,6 +206,13 @@ func TerminalTool() fantasy.AgentTool {
 				return fantasy.NewTextErrorResponse(err.Error()), nil
 			}
 			defer handle.Release(ctx)
+
+			title := strings.TrimSpace(in.Command + " " + strings.Join(in.Args, " "))
+			stream := agentutil.NewSessionStream(client, SessionFrom(ctx))
+			upd := acp.UpdateToolCallDelta(acp.ToolCallID(tc.ID))
+			upd.ToolCallUpdate.Title = title
+			upd.ToolCallUpdate.Content = []acp.ToolCallContent{acp.ToolTerminal(handle.ID)}
+			stream.SendUpdate(ctx, upd)
 
 			exitResp, err := handle.WaitForExit(ctx)
 			if err != nil {
@@ -155,15 +239,10 @@ func TerminalTool() fantasy.AgentTool {
 
 // TerminalCreateTool creates a new terminal and returns its ID.
 func TerminalCreateTool() fantasy.AgentTool {
-	type input struct {
-		Command string   `json:"command" description:"The shell command to execute"`
-		Args    []string `json:"args,omitempty" description:"Command arguments"`
-		Cwd     string   `json:"cwd,omitempty" description:"Working directory for the command"`
-	}
 	return fantasy.NewAgentTool(
 		ToolNameTerminalCreate,
 		"Create a new terminal running a command. Returns the terminal ID.",
-		func(ctx context.Context, in input, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
+		func(ctx context.Context, in TerminalInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			client := ClientFrom(ctx)
 			terminal, ok := client.(acp.ClientTerminal)
 			if !ok {

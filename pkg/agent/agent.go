@@ -1,10 +1,7 @@
-// Package agent wires the ACP protocol, the LLM bridge, and storage together
-// into a fully functional ACP agent.
 package agent
 
 import (
 	"context"
-	"sync"
 
 	"charm.land/fantasy"
 	acp "github.com/carsonfarmer/go-acp-sdk"
@@ -13,11 +10,10 @@ import (
 	"github.com/carsonfarmer/mica/pkg/llm"
 )
 
-// AgentSession is the persisted session type. It embeds *acp.SessionInfo for
-// protocol fields and adds Model for LLM selection.
 type AgentSession struct {
 	*acp.SessionInfo
-	Model string `json:"model"`
+	Model        llm.FullModelID `json:"model"`
+	ThoughtLevel string          `json:"thoughtLevel,omitempty"`
 }
 
 // Agent implements acp.Agent and optional session lifecycle interfaces.
@@ -27,14 +23,13 @@ type Agent struct {
 	bc         *agentutil.SessionBroadcaster
 	name       string
 	tools      []fantasy.AgentTool
-	cancellers map[acp.SessionID]*agentutil.SessionCanceller
-	mu         sync.Mutex
+	cancellers *agentutil.CancellerMap
 }
 
 // Option configures an Agent.
 type Option func(*Agent)
 
-// WithName sets the agent name reported in Initialize responses.
+// WithName sets the agent name.
 func WithName(name string) Option {
 	return func(a *Agent) { a.name = name }
 }
@@ -51,15 +46,13 @@ func New(reg *llm.Registry, store storage.Store[*AgentSession], opts ...Option) 
 		store:      store,
 		bc:         agentutil.NewSessionBroadcaster(),
 		name:       "mica",
-		cancellers: make(map[acp.SessionID]*agentutil.SessionCanceller),
+		cancellers: agentutil.NewCancellerMap(),
 	}
 	for _, o := range opts {
 		o(a)
 	}
 	return a
 }
-
-// ACP interface methods
 
 func (a *Agent) Initialize(_ context.Context, req *acp.InitializeRequest) (*acp.InitializeResponse, error) {
 	return &acp.InitializeResponse{
@@ -87,27 +80,33 @@ func (a *Agent) Authenticate(_ context.Context, _ *acp.AuthenticateRequest) (*ac
 func (a *Agent) NewSession(ctx context.Context, req *acp.NewSessionRequest, client acp.Client) (*acp.NewSessionResponse, error) {
 	sid := acp.SessionID(acp.NewUUID())
 
-	if err := a.store.Set(ctx, sid, &AgentSession{
+	sess := &AgentSession{
 		SessionInfo: &acp.SessionInfo{SessionID: sid, CWD: req.CWD},
 		Model:       a.reg.Default(),
-	}); err != nil {
+	}
+	if err := a.store.Set(ctx, sid, sess); err != nil {
 		return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
 	}
 
 	a.bc.Subscribe(sid, client)
 
-	return &acp.NewSessionResponse{SessionID: sid}, nil
+	return &acp.NewSessionResponse{
+		SessionID:     sid,
+		ConfigOptions: a.getSessionConfigOptions(sess),
+	}, nil
 }
 
 func (a *Agent) LoadSession(ctx context.Context, req *acp.LoadSessionRequest, client acp.Client) (*acp.LoadSessionResponse, error) {
 	a.bc.Subscribe(req.SessionID, client)
 
-	events, err := a.store.Load(ctx, req.SessionID)
+	sess, _, err := a.store.Get(ctx, req.SessionID)
 	if err != nil {
 		return nil, err
 	}
-	if len(events) == 0 {
-		return &acp.LoadSessionResponse{}, nil
+
+	events, err := a.store.Load(ctx, req.SessionID)
+	if err != nil {
+		return nil, err
 	}
 
 	stream := agentutil.NewSessionStream(client, req.SessionID)
@@ -117,28 +116,19 @@ func (a *Agent) LoadSession(ctx context.Context, req *acp.LoadSessionRequest, cl
 		}
 	}
 
-	return &acp.LoadSessionResponse{}, nil
+	return &acp.LoadSessionResponse{
+		ConfigOptions: a.getSessionConfigOptions(sess),
+	}, nil
 }
 
 func (a *Agent) CloseSession(_ context.Context, req *acp.CloseSessionRequest, client acp.Client) (*acp.CloseSessionResponse, error) {
 	a.bc.Unsubscribe(req.SessionID, client)
-
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if c, ok := a.cancellers[req.SessionID]; ok {
-		c.End()
-		delete(a.cancellers, req.SessionID)
-	}
-
+	a.cancellers.End(req.SessionID)
 	return &acp.CloseSessionResponse{}, nil
 }
 
 func (a *Agent) Cancel(_ context.Context, notif *acp.CancelNotification) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if c, ok := a.cancellers[notif.SessionID]; ok {
-		c.Cancel()
-	}
+	a.cancellers.Cancel(notif.SessionID)
 	return nil
 }
 
@@ -147,58 +137,55 @@ func (a *Agent) ListSessions(ctx context.Context, _ *acp.ListSessionsRequest) (*
 	if err != nil {
 		return nil, err
 	}
-	infos := make([]acp.SessionInfo, 0, len(sessions))
-	for _, s := range sessions {
-		infos = append(infos, *s.SessionInfo)
-	}
-	return &acp.ListSessionsResponse{Sessions: infos}, nil
+	return &acp.ListSessionsResponse{Sessions: sessions}, nil
 }
 
 func (a *Agent) ResumeSession(ctx context.Context, req *acp.ResumeSessionRequest, client acp.Client) (*acp.ResumeSessionResponse, error) {
 	a.bc.Subscribe(req.SessionID, client)
-	if _, err := a.store.Get(ctx, req.SessionID); err != nil {
-		return nil, err
-	}
-	return &acp.ResumeSessionResponse{}, nil
-}
-
-func (a *Agent) ForkSession(ctx context.Context, req *acp.ForkSessionRequest, client acp.Client) (*acp.ForkSessionResponse, error) {
-	parent, err := a.store.Get(ctx, req.SessionID)
+	sess, _, err := a.store.Get(ctx, req.SessionID)
 	if err != nil {
 		return nil, err
 	}
+	return &acp.ResumeSessionResponse{
+		ConfigOptions: a.getSessionConfigOptions(sess),
+	}, nil
+}
 
-	head, err := a.store.Head(ctx, req.SessionID)
+func (a *Agent) ForkSession(ctx context.Context, req *acp.ForkSessionRequest, client acp.Client) (*acp.ForkSessionResponse, error) {
+	parent, parentHead, err := a.store.Get(ctx, req.SessionID)
 	if err != nil {
 		return nil, err
 	}
 
 	sid := acp.SessionID(acp.NewUUID())
-
-	if err := a.store.Set(ctx, sid, &AgentSession{
-		SessionInfo: &acp.SessionInfo{SessionID: sid, CWD: parent.CWD},
-		Model:       parent.Model,
-	}); err != nil {
+	sess := &AgentSession{
+		SessionInfo:  &acp.SessionInfo{SessionID: sid, CWD: parent.CWD},
+		Model:        parent.Model,
+		ThoughtLevel: parent.ThoughtLevel,
+	}
+	if err := a.store.Set(ctx, sid, sess); err != nil {
 		return nil, err
 	}
 
-	if head != nil {
-		if err := a.store.Commit(ctx, sid, *head); err != nil {
+	if parentHead != nil {
+		if err := a.store.Commit(ctx, sid, *parentHead); err != nil {
 			return nil, err
 		}
 	}
 
 	a.bc.Subscribe(sid, client)
 
-	return &acp.ForkSessionResponse{SessionID: sid}, nil
+	return &acp.ForkSessionResponse{
+		SessionID:     sid,
+		ConfigOptions: a.getSessionConfigOptions(sess),
+	}, nil
 }
 
-// Interface checks.
 var (
-	_ acp.Agent               = (*Agent)(nil)
-	_ acp.AgentSessionLoader  = (*Agent)(nil)
-	_ acp.AgentSessionCloser  = (*Agent)(nil)
-	_ acp.AgentSessionLister  = (*Agent)(nil)
-	_ acp.AgentSessionResumer = (*Agent)(nil)
-	_ acp.AgentSessionForker  = (*Agent)(nil)
+	_ acp.Agent                = (*Agent)(nil)
+	_ acp.AgentSessionLoader   = (*Agent)(nil)
+	_ acp.AgentSessionCloser   = (*Agent)(nil)
+	_ acp.AgentSessionLister   = (*Agent)(nil)
+	_ acp.AgentSessionResumer  = (*Agent)(nil)
+	_ acp.AgentSessionForker   = (*Agent)(nil)
 )

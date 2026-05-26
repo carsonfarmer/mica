@@ -15,7 +15,7 @@ import (
 // Only message-carrying variants are converted (user/agent/thought chunks,
 // tool calls and results). Other update types (plan, mode, config, usage, etc.)
 // are transient notifications and not part of the conversation history.
-func HistoryToMessages(updates []acp.SessionUpdate) []fantasy.Message {
+func UpdatesToMessages(updates []acp.SessionUpdate) []fantasy.Message {
 	var msgs []fantasy.Message
 	for _, u := range updates {
 		switch {
@@ -83,8 +83,8 @@ func convertToolCallUpdate(tu *acp.SessionUpdateToolCallUpdate) *fantasy.Message
 	case len(tu.Content) > 0:
 		result = toolContentToResult(tu.Content)
 	case tu.RawOutput != nil:
-		if b, err := json.Marshal(tu.RawOutput); err == nil {
-			result = fantasy.ToolResultOutputContentText{Text: string(b)}
+		if s, ok := tu.RawOutput.(string); ok {
+			result = fantasy.ToolResultOutputContentText{Text: s}
 		}
 	}
 	return &fantasy.Message{
@@ -205,7 +205,7 @@ func MessageToACP(msg fantasy.Message) []acp.SessionUpdate {
 				updates = append(updates, acp.UpdateAgentThought(acp.TextBlock(p.Text)))
 			case fantasy.ToolCallPart:
 				u := acp.UpdateToolCallStart(p.ToolCallID, p.ToolName)
-				u.ToolCall.RawInput = p.Input
+				u.ToolCall.RawInput = json.RawMessage(p.Input)
 				updates = append(updates, u)
 			}
 		}
