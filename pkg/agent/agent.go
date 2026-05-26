@@ -14,6 +14,8 @@ type AgentSession struct {
 	*acp.SessionInfo
 	Model        llm.FullModelID `json:"model"`
 	ThoughtLevel string          `json:"thoughtLevel,omitempty"`
+	TotalUsage   acp.Usage       `json:"totalUsage,omitzero"`
+	TotalCost    *acp.Cost       `json:"totalCost,omitempty"`
 }
 
 // Agent implements acp.Agent and optional session lifecycle interfaces.

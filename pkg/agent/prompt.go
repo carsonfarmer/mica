@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"time"
 
-	"charm.land/catwalk/pkg/catwalk"
 	"charm.land/fantasy"
 	"charm.land/fantasy/providers/openai"
 	"charm.land/fantasy/providers/openaicompat"
@@ -148,12 +147,25 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 
 	if usage != nil {
 		cfg, _ := a.reg.Config(sess.Model)
-		cost := computeCost(cfg, usage)
-		upd := acp.UpdateUsage(usage.TotalTokens, 0, cost)
+		turnCost := computeCost(cfg, usage)
+
+		// Accumulate into session totals.
+		accumulateUsage(&sess.TotalUsage, usage)
+		if turnCost != nil {
+			if sess.TotalCost == nil {
+				sess.TotalCost = &acp.Cost{Currency: "USD"}
+			}
+			sess.TotalCost.Amount += turnCost.Amount
+		}
+		a.store.Set(ctx, req.SessionID, sess)
+
+		// Send cumulative usage to client.
+		size := uint64(cfg.ContextWindow)
+		upd := acp.UpdateUsage(sess.TotalUsage.TotalTokens, size, sess.TotalCost)
 		if head, err = a.store.Append(ctx, req.SessionID, upd, head); err != nil {
 			return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
 		}
-		stream.SendUsageUpdate(ctx, usage.TotalTokens, 0, cost)
+		stream.SendUsageUpdate(ctx, sess.TotalUsage.TotalTokens, size, sess.TotalCost)
 	}
 
 	if head != nil {
@@ -165,27 +177,4 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 		Usage:         usage,
 		UserMessageID: userMsgID,
 	}, nil
-}
-
-func computeCost(cfg catwalk.Model, usage *acp.Usage) *acp.Cost {
-	if usage == nil {
-		return nil
-	}
-	var total float64
-	if cfg.CostPer1MIn > 0 && usage.InputTokens > 0 {
-		total += float64(usage.InputTokens) * cfg.CostPer1MIn / 1e6
-	}
-	if cfg.CostPer1MOut > 0 && usage.OutputTokens > 0 {
-		total += float64(usage.OutputTokens) * cfg.CostPer1MOut / 1e6
-	}
-	if cfg.CostPer1MInCached > 0 && usage.CachedReadTokens != nil && *usage.CachedReadTokens > 0 {
-		total += float64(*usage.CachedReadTokens) * cfg.CostPer1MInCached / 1e6
-	}
-	if cfg.CostPer1MOutCached > 0 && usage.CachedWriteTokens != nil && *usage.CachedWriteTokens > 0 {
-		total += float64(*usage.CachedWriteTokens) * cfg.CostPer1MOutCached / 1e6
-	}
-	if total == 0 {
-		return nil
-	}
-	return &acp.Cost{Amount: total, Currency: "USD"}
 }
