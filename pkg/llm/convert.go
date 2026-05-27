@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"charm.land/catwalk/pkg/catwalk"
 	"charm.land/fantasy"
 	"github.com/carsonfarmer/go-acp-sdk"
 )
@@ -243,5 +244,26 @@ func UsageToACP(u fantasy.Usage) *acp.Usage {
 		ThoughtTokens:     new(uint64(u.ReasoningTokens)),
 		CachedReadTokens:  new(uint64(u.CacheReadTokens)),
 		CachedWriteTokens: new(uint64(u.CacheCreationTokens)),
+	}
+}
+
+func catwalkTypeToACP(t catwalk.Type) acp.LlmProtocol {
+	switch t {
+	case catwalk.TypeAnthropic:
+		return acp.LlmProtocolAnthropic
+	case catwalk.TypeGoogle:
+		return acp.LlmProtocolGoogle
+	case catwalk.TypeAzure:
+		return acp.LlmProtocolAzure
+	case catwalk.TypeBedrock:
+		return acp.LlmProtocolBedrock
+	case catwalk.TypeVertexAI:
+		return acp.LlmProtocolVertex
+	case catwalk.TypeOpenRouter:
+		return acp.LlmProtocolOpenRouter
+	case catwalk.TypeOpenAI:
+		return acp.LlmProtocolOpenAI
+	default:
+		return acp.LlmProtocolOpenAICompat
 	}
 }

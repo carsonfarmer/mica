@@ -6,8 +6,6 @@ import (
 	"time"
 
 	"charm.land/fantasy"
-	"charm.land/fantasy/providers/openai"
-	"charm.land/fantasy/providers/openaicompat"
 	acp "github.com/carsonfarmer/go-acp-sdk"
 	"github.com/carsonfarmer/go-acp-sdk/agentutil"
 	"github.com/carsonfarmer/mica/pkg/llm"
@@ -29,6 +27,8 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 	if err != nil {
 		return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
 	}
+
+	cfg, _ := a.reg.Config(sess.Model)
 
 	userMsgID := req.MessageID
 	if userMsgID == "" {
@@ -57,19 +57,20 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 
 	stream := agentutil.NewSessionStream(a.bc, req.SessionID)
 
-	agentOpts := []fantasy.AgentOption{fantasy.WithTools(a.tools...)}
-	if cfg, ok := a.reg.Config(sess.Model); ok && cfg.DefaultMaxTokens > 0 {
+	agentOpts := []fantasy.AgentOption{
+		fantasy.WithSystemPrompt(SystemPrompt),
+		fantasy.WithTools(a.tools...),
+	}
+	if cfg.DefaultMaxTokens > 0 {
 		agentOpts = append(agentOpts, fantasy.WithMaxOutputTokens(cfg.DefaultMaxTokens))
 	}
 	fa := fantasy.NewAgent(model, agentOpts...)
 
+	providerOpts := a.reg.ProviderOptions(sess.Model, sess.ThoughtLevel)
+
 	call := fantasy.AgentStreamCall{
-		Messages: history,
-		ProviderOptions: fantasy.ProviderOptions{
-			openaicompat.TypeProviderOptions: &openaicompat.ProviderOptions{
-				ReasoningEffort: openai.ReasoningEffortOption(openai.ReasoningEffort(sess.ThoughtLevel)),
-			},
-		},
+		Messages:        history,
+		ProviderOptions: providerOpts,
 		OnTextDelta: func(id, text string) error {
 			return stream.SendText(ctx, text, id)
 		},
@@ -146,7 +147,6 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 	}
 
 	if usage != nil {
-		cfg, _ := a.reg.Config(sess.Model)
 		turnCost := computeCost(cfg, usage)
 
 		// Accumulate into session totals.

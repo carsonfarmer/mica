@@ -84,12 +84,13 @@ func (a *Agent) getSessionConfigOptions(sess *AgentSession) []acp.SessionConfigO
 	if len(groups) > 0 {
 		opts = append(opts, acp.SessionConfigOption{
 			Select: &acp.SessionConfigSelect{
-				Type:        acp.ConfigTypeSelect,
-				ID:          string(acp.ConfigCatModel),
-				Name:        "Model",
-				Category:    acp.ConfigCatModel,
-				Description: "Select the LLM model for this session.",
-				Options:     &acp.SessionConfigSelectOptions{Grouped: groups},
+				Type:         acp.ConfigTypeSelect,
+				ID:           string(acp.ConfigCatModel),
+				Name:         "Model",
+				Category:     acp.ConfigCatModel,
+				Description:  "Select the LLM model for this session.",
+				CurrentValue: acp.SessionConfigValueID(sess.Model.String()),
+				Options:      &acp.SessionConfigSelectOptions{Grouped: groups},
 			},
 		})
 	}

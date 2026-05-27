@@ -3,15 +3,22 @@ package llm
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"charm.land/catwalk/pkg/catwalk"
 	"charm.land/fantasy"
+	"charm.land/fantasy/providers/anthropic"
+	"charm.land/fantasy/providers/google"
+	"charm.land/fantasy/providers/openai"
+	"charm.land/fantasy/providers/openaicompat"
+	"charm.land/fantasy/providers/openrouter"
 	acp "github.com/carsonfarmer/go-acp-sdk"
 )
 
 type entry struct {
 	catwalk catwalk.Provider
 	fantasy fantasy.Provider
+	models  map[string]catwalk.Model
 }
 
 // Registry maps catwalk providers to fantasy providers and their models.
@@ -31,7 +38,11 @@ func (r *Registry) AddProvider(cw catwalk.Provider) error {
 	if err != nil {
 		return fmt.Errorf("llm: %w", err)
 	}
-	r.providers[cw.ID] = &entry{catwalk: cw, fantasy: prov}
+	ent := &entry{catwalk: cw, fantasy: prov, models: make(map[string]catwalk.Model)}
+	for _, m := range cw.Models {
+		ent.models[m.ID] = m
+	}
+	r.providers[cw.ID] = ent
 	r.default_ = FullModelID{Provider: cw.ID, Model: cw.DefaultLargeModelID}
 	return nil
 }
@@ -49,14 +60,10 @@ func (r *Registry) Resolve(ctx context.Context, mid FullModelID) (fantasy.Langua
 func (r *Registry) Config(mid FullModelID) (catwalk.Model, bool) {
 	ent, ok := r.providers[mid.Provider]
 	if !ok {
-		return catwalk.Model{}, false
+		return catwalk.Model{}, ok
 	}
-	for _, m := range ent.catwalk.Models {
-		if m.ID == mid.Model {
-			return m, true
-		}
-	}
-	return catwalk.Model{}, false
+	m, ok := ent.models[mid.Model]
+	return m, ok
 }
 
 // Default returns the default model ID.
@@ -67,7 +74,7 @@ func (r *Registry) Providers() []acp.ProviderInfo {
 	var out []acp.ProviderInfo
 	for _, ent := range r.providers {
 		out = append(out, acp.ProviderInfo{
-			ID:        string(ent.catwalk.Type),
+			ID:        string(ent.catwalk.ID),
 			Supported: []acp.LlmProtocol{catwalkTypeToACP(ent.catwalk.Type)},
 			Current: &acp.ProviderCurrentConfig{
 				APIType: catwalkTypeToACP(ent.catwalk.Type),
@@ -78,57 +85,79 @@ func (r *Registry) Providers() []acp.ProviderInfo {
 	return out
 }
 
-func catwalkTypeToACP(t catwalk.Type) acp.LlmProtocol {
-	switch t {
-	case catwalk.TypeAnthropic:
-		return acp.LlmProtocolAnthropic
-	case catwalk.TypeGoogle:
-		return acp.LlmProtocolGoogle
-	case catwalk.TypeAzure:
-		return acp.LlmProtocolAzure
-	case catwalk.TypeBedrock:
-		return acp.LlmProtocolBedrock
-	case catwalk.TypeVertexAI:
-		return acp.LlmProtocolVertex
-	case catwalk.TypeOpenRouter:
-		return acp.LlmProtocolOpenRouter
+// ProviderOptions returns the fantasy provider options for a model and thought level.
+func (r *Registry) ProviderOptions(mid FullModelID, thoughtLevel string) fantasy.ProviderOptions {
+	if thoughtLevel == "" {
+		return nil
+	}
+	ent, ok := r.providers[mid.Provider]
+	if !ok {
+		return nil
+	}
+	cfg, ok := ent.models[mid.Model]
+	if !ok {
+		return nil
+	}
+	switch ent.catwalk.Type {
 	case catwalk.TypeOpenAI:
-		return acp.LlmProtocolOpenAI
+		effort := openai.ReasoningEffort(thoughtLevel)
+		return fantasy.ProviderOptions{
+			openai.Name: &openai.ProviderOptions{ReasoningEffort: &effort},
+		}
+	case catwalk.TypeOpenAICompat:
+		effort := openai.ReasoningEffort(thoughtLevel)
+		return fantasy.ProviderOptions{
+			openaicompat.Name: &openaicompat.ProviderOptions{ReasoningEffort: &effort},
+		}
+	case catwalk.TypeAnthropic:
+		effort := anthropic.Effort(thoughtLevel)
+		return fantasy.ProviderOptions{
+			anthropic.Name: &anthropic.ProviderOptions{
+				Effort:        &effort,
+				SendReasoning: &cfg.CanReason,
+			},
+		}
+	case catwalk.TypeGoogle:
+		level := strings.ToUpper(thoughtLevel)
+		return fantasy.ProviderOptions{
+			google.Name: &google.ProviderOptions{
+				ThinkingConfig: &google.ThinkingConfig{
+					ThinkingLevel:   &level,
+					IncludeThoughts: &cfg.CanReason,
+				},
+			},
+		}
+	case catwalk.TypeOpenRouter:
+		effort := openrouter.ReasoningEffort(thoughtLevel)
+		return fantasy.ProviderOptions{
+			openrouter.Name: &openrouter.ProviderOptions{
+				Reasoning: &openrouter.ReasoningOptions{
+					Enabled: &cfg.CanReason,
+					Effort:  &effort,
+				},
+			},
+		}
 	default:
-		return acp.LlmProtocolOpenAICompat
+		return nil
 	}
 }
 
 // Models returns all models for a given provider as ACP ModelInfo.
 func (r *Registry) Models(providerID string) []acp.ModelInfo {
-	return r.modelsFor(catwalk.InferenceProvider(providerID))
-}
-
-func (r *Registry) modelsFor(id catwalk.InferenceProvider) []acp.ModelInfo {
-	ent, ok := r.providers[id]
+	ent, ok := r.providers[catwalk.InferenceProvider(providerID)]
 	if !ok {
 		return nil
 	}
 	out := make([]acp.ModelInfo, 0, len(ent.catwalk.Models))
 	for _, m := range ent.catwalk.Models {
-		out = append(out, catwalkToModelInfo(string(id), m))
+		info := acp.ModelInfo{
+			ModelID: acp.ModelID(FullModelID{Provider: ent.catwalk.ID, Model: m.ID}.String()),
+			Name:    m.Name,
+		}
+		if m.ContextWindow > 0 {
+			info.Description = fmt.Sprintf("%.1gM ctx", float64(m.ContextWindow)/1e6)
+		}
+		out = append(out, info)
 	}
 	return out
-}
-
-func catwalkToModelInfo(provID string, m catwalk.Model) acp.ModelInfo {
-	info := acp.ModelInfo{
-		ModelID: acp.ModelID(fmt.Sprintf("%s/%s", provID, m.ID)),
-		Name:    m.Name,
-	}
-	if m.ContextWindow > 0 && m.DefaultMaxTokens > 0 {
-		ctxK := m.ContextWindow / 1024
-		outK := m.DefaultMaxTokens / 1024
-		if ctxK >= 1000 {
-			info.Description = fmt.Sprintf("%dM ctx / %dK out", ctxK/1024, outK)
-		} else {
-			info.Description = fmt.Sprintf("%dK ctx / %dK out", ctxK, outK)
-		}
-	}
-	return info
 }

@@ -54,26 +54,6 @@ func SessionFrom(ctx context.Context) acp.SessionID {
 	return s
 }
 
-// ReadFileInput is the input for the read_file tool.
-type ReadFileInput struct {
-	Path  string `json:"path" description:"Absolute path to the file to read"`
-	Line  int    `json:"line,omitempty" description:"Line number to start reading from (1-indexed)"`
-	Limit int    `json:"limit,omitempty" description:"Maximum number of lines to read"`
-}
-
-// WriteFileInput is the input for the write_file tool.
-type WriteFileInput struct {
-	Path    string `json:"path" description:"Absolute path to the file to write"`
-	Content string `json:"content" description:"Content to write to the file"`
-}
-
-// TerminalInput is the input for terminal tools.
-type TerminalInput struct {
-	Command string   `json:"command" description:"The shell command to execute"`
-	Args    []string `json:"args,omitempty" description:"Command arguments"`
-	Cwd     string   `json:"cwd,omitempty" description:"Working directory for the command"`
-}
-
 // TitleForTool returns a human-readable title for a tool call.
 func TitleForTool(name, input string, cwd string) string {
 	switch name {
@@ -110,6 +90,13 @@ func TitleForTool(name, input string, cwd string) string {
 	return name
 }
 
+// ReadFileInput is the input for the read_file tool.
+type ReadFileInput struct {
+	Path  string `json:"path" description:"Absolute path to the file to read"`
+	Line  int    `json:"line,omitempty" description:"Line number to start reading from (1-indexed)"`
+	Limit int    `json:"limit,omitempty" description:"Maximum number of lines to read"`
+}
+
 // ReadFileTool creates a tool that reads a file via the ACP client.
 func ReadFileTool() fantasy.AgentTool {
 	return fantasy.NewParallelAgentTool(
@@ -140,6 +127,12 @@ func ReadFileTool() fantasy.AgentTool {
 			return r, nil
 		},
 	)
+}
+
+// WriteFileInput is the input for the write_file tool.
+type WriteFileInput struct {
+	Path    string `json:"path" description:"Absolute path to the file to write"`
+	Content string `json:"content" description:"Content to write to the file"`
 }
 
 // WriteFileTool creates a tool that writes a file via the ACP client.
@@ -184,6 +177,13 @@ func WriteFileTool() fantasy.AgentTool {
 	)
 }
 
+// TerminalInput is the input for terminal tools.
+type TerminalInput struct {
+	Command string   `json:"command" description:"The shell command to execute"`
+	Args    []string `json:"args,omitempty" description:"Command arguments"`
+	Cwd     string   `json:"cwd,omitempty" description:"Working directory for the command"`
+}
+
 // TerminalTool creates a combined terminal tool.
 func TerminalTool() fantasy.AgentTool {
 	return fantasy.NewAgentTool(
@@ -224,15 +224,11 @@ func TerminalTool() fantasy.AgentTool {
 				return fantasy.NewTextErrorResponse(err.Error()), nil
 			}
 
-			var b strings.Builder
-			fmt.Fprintf(&b, "%s", outResp.Output)
-			if exitResp.ExitCode != nil {
-				fmt.Fprintf(&b, "\n[Exit code: %d]", *exitResp.ExitCode)
-			}
-			if exitResp.Signal != "" {
-				fmt.Fprintf(&b, "\n[Exited by signal: %s]", exitResp.Signal)
-			}
-			return fantasy.NewTextResponse(b.String()), nil
+			raw, _ := json.Marshal(struct {
+				*acp.WaitForTerminalExitResponse
+				*acp.TerminalOutputResponse
+			}{exitResp, outResp})
+			return fantasy.NewTextResponse(string(raw)), nil
 		},
 	)
 }
@@ -257,20 +253,22 @@ func TerminalCreateTool() fantasy.AgentTool {
 			if err != nil {
 				return fantasy.NewTextErrorResponse(err.Error()), nil
 			}
-			return fantasy.NewTextResponse(resp.TerminalID), nil
+			raw, _ := json.Marshal(resp)
+			return fantasy.NewTextResponse(string(raw)), nil
 		},
 	)
 }
 
+type TerminalIDInput struct {
+	TerminalID string `json:"terminal_id" description:"The terminal ID from terminal_create"`
+}
+
 // TerminalOutputTool gets the current output of a terminal.
 func TerminalOutputTool() fantasy.AgentTool {
-	type input struct {
-		TerminalID string `json:"terminal_id" description:"The terminal ID from terminal_create"`
-	}
 	return fantasy.NewAgentTool(
 		ToolNameTerminalOutput,
 		"Get the current output of a terminal without waiting for exit.",
-		func(ctx context.Context, in input, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
+		func(ctx context.Context, in TerminalIDInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			client := ClientFrom(ctx)
 			terminal, ok := client.(acp.ClientTerminal)
 			if !ok {
@@ -283,20 +281,18 @@ func TerminalOutputTool() fantasy.AgentTool {
 			if err != nil {
 				return fantasy.NewTextErrorResponse(err.Error()), nil
 			}
-			return fantasy.NewTextResponse(out.Output), nil
+			raw, _ := json.Marshal(out)
+			return fantasy.NewTextResponse(string(raw)), nil
 		},
 	)
 }
 
 // TerminalWaitTool waits for a terminal command to exit.
 func TerminalWaitTool() fantasy.AgentTool {
-	type input struct {
-		TerminalID string `json:"terminal_id" description:"The terminal ID from terminal_create"`
-	}
 	return fantasy.NewAgentTool(
 		ToolNameTerminalWait,
 		"Wait for a terminal command to complete and return its exit status.",
-		func(ctx context.Context, in input, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
+		func(ctx context.Context, in TerminalIDInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			client := ClientFrom(ctx)
 			terminal, ok := client.(acp.ClientTerminal)
 			if !ok {
@@ -317,13 +313,10 @@ func TerminalWaitTool() fantasy.AgentTool {
 
 // TerminalKillTool kills a terminal command.
 func TerminalKillTool() fantasy.AgentTool {
-	type input struct {
-		TerminalID string `json:"terminal_id" description:"The terminal ID from terminal_create"`
-	}
 	return fantasy.NewAgentTool(
 		ToolNameTerminalKill,
 		"Kill a running terminal command without releasing it.",
-		func(ctx context.Context, in input, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
+		func(ctx context.Context, in TerminalIDInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			client := ClientFrom(ctx)
 			terminal, ok := client.(acp.ClientTerminal)
 			if !ok {
@@ -343,13 +336,10 @@ func TerminalKillTool() fantasy.AgentTool {
 
 // TerminalReleaseTool kills a terminal command and frees its resources.
 func TerminalReleaseTool() fantasy.AgentTool {
-	type input struct {
-		TerminalID string `json:"terminal_id" description:"The terminal ID from terminal_create"`
-	}
 	return fantasy.NewAgentTool(
 		ToolNameTerminalRelease,
 		"Release a terminal and free its resources. Kills the command if still running.",
-		func(ctx context.Context, in input, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
+		func(ctx context.Context, in TerminalIDInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			client := ClientFrom(ctx)
 			terminal, ok := client.(acp.ClientTerminal)
 			if !ok {
@@ -367,17 +357,24 @@ func TerminalReleaseTool() fantasy.AgentTool {
 	)
 }
 
+// PlanInput is the input for the plan tool.
+type PlanInput struct {
+	Entries []acp.PlanEntry `json:"entries" description:"Ordered list of plan steps."`
+}
+
 // PlanTool creates a plan tool for the model to declare its approach.
+// The agent should use this tool for any work that involves more than a single step.
 func PlanTool() fantasy.AgentTool {
 	return fantasy.NewParallelAgentTool(
 		ToolNamePlan,
-		"Declare a plan or approach for the current task.",
-		func(ctx context.Context, entries []acp.PlanEntry, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
+		"Declare an ordered plan for multi-step tasks. Always use this for work involving more than a single step.",
+		func(ctx context.Context, in PlanInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			stream := agentutil.NewSessionStream(ClientFrom(ctx), SessionFrom(ctx))
-			if err := stream.SendPlan(ctx, entries); err != nil {
+			if err := stream.SendPlan(ctx, in.Entries); err != nil {
 				return fantasy.NewTextErrorResponse(err.Error()), nil
 			}
-			return fantasy.NewTextResponse("Plan accepted."), nil
+			raw, _ := json.Marshal(in.Entries)
+			return fantasy.NewTextResponse(string(raw)), nil
 		},
 	)
 }
