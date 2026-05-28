@@ -10,7 +10,6 @@ import (
 	"charm.land/fantasy"
 	"github.com/carsonfarmer/go-acp-sdk"
 	"github.com/carsonfarmer/go-acp-sdk/agentutil"
-	"github.com/samber/lo"
 )
 
 // Tool names.
@@ -381,9 +380,15 @@ func PlanTool() fantasy.AgentTool {
 			if err := stream.SendPlan(ctx, in.Entries); err != nil {
 				return fantasy.NewTextErrorResponse(err.Error()), nil
 			}
-			md := strings.Join(lo.Map(in.Entries, func(e acp.PlanEntry, _ int) string {
-				return fmt.Sprintf("- [%s] %s  *(%s)*", lo.Ternary(e.Status == "completed", "x", " "), e.Content, e.Priority)
-			}), "\n")
+			var b strings.Builder
+			for _, e := range in.Entries {
+				s := " "
+				if e.Status == "completed" {
+					s = "x"
+				}
+				fmt.Fprintf(&b, "- [%s] (*%s*) %s  **(%s)**\n", s, e.Status, e.Content, e.Priority)
+			}
+			md := b.String()
 			upd := acp.UpdateToolCallDelta(acp.ToolCallID(tc.ID))
 			upd.ToolCallUpdate.Content = []acp.ToolCallContent{acp.ToolContent(acp.TextBlock(md))}
 			upd.ToolCallUpdate.RawInput = in

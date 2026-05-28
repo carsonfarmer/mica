@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"charm.land/fantasy"
@@ -58,7 +59,7 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 	stream := agentutil.NewSessionStream(a.bc, req.SessionID)
 
 	agentOpts := []fantasy.AgentOption{
-		fantasy.WithSystemPrompt(SystemPrompt),
+		fantasy.WithSystemPrompt(fmt.Sprintf(SystemPrompt, req.SessionID, sess.CWD)),
 		fantasy.WithTools(a.tools...),
 	}
 	if cfg.DefaultMaxTokens > 0 {
