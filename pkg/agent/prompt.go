@@ -77,33 +77,20 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 		OnReasoningDelta: func(id, text string) error {
 			return stream.SendThought(ctx, text, id)
 		},
+		OnToolInputStart: func(id, toolName string) error {
+			kind := llm.ToolNameToACP(toolName)
+			return stream.StartToolCall(ctx, acp.ToolCallID(id), toolName, kind)
+		},
 		OnToolCall: func(tc fantasy.ToolCallContent) error {
 			title := llm.TitleForTool(tc.ToolName, string(tc.Input), sess.CWD)
-			kind := llm.ToolNameToACP(tc.ToolName)
-			upd := acp.UpdateToolCallStart(acp.ToolCallID(tc.ToolCallID), title)
-			upd.ToolCall.Kind = new(acp.ToolKind)
-			*upd.ToolCall.Kind = kind
 			status := acp.ToolInProgress
-			upd.ToolCall.Status = &status
-			upd.ToolCall.RawInput = json.RawMessage(tc.Input)
-			return stream.SendUpdate(ctx, upd)
+			update := acp.UpdateToolCallDelta(tc.ToolCallID)
+			update.ToolCallUpdate.Title = title
+			update.ToolCallUpdate.Status = &status
+			return stream.SendUpdate(ctx, update)
 		},
 		OnToolResult: func(tr fantasy.ToolResultContent) error {
-			status := acp.ToolCompleted
-			var text string
-			switch o := tr.Result.(type) {
-			case fantasy.ToolResultOutputContentText:
-				text = o.Text
-			case fantasy.ToolResultOutputContentError:
-				status = acp.ToolFailed
-				if o.Error != nil {
-					text = o.Error.Error()
-				}
-			}
-			upd := acp.UpdateToolCallDelta(tr.ToolCallID)
-			upd.ToolCallUpdate.Status = &status
-			upd.ToolCallUpdate.RawOutput = text
-			return stream.SendUpdate(ctx, upd)
+			return stream.SendUpdate(ctx, llm.ToolResultToACP(tr))
 		},
 	}
 

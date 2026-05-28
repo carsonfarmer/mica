@@ -9,7 +9,8 @@ import (
 	"github.com/carsonfarmer/mica/pkg/llm"
 )
 
-func (a *Agent) SetSessionConfigOption(ctx context.Context, req *acp.SetSessionConfigOptionRequest) (*acp.SetSessionConfigOptionResponse, error) {
+// SetSessionConfigOption implements acp.AgentSessionConfigSetter.
+func (a *Agent) SetSessionConfigOption(ctx context.Context, req *acp.SetSessionConfigOptionRequest, _ acp.Client) (*acp.SetSessionConfigOptionResponse, error) {
 	sess, _, err := a.store.Get(ctx, req.SessionID)
 	if err != nil {
 		return nil, err

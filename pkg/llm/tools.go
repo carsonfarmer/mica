@@ -10,6 +10,7 @@ import (
 	"charm.land/fantasy"
 	"github.com/carsonfarmer/go-acp-sdk"
 	"github.com/carsonfarmer/go-acp-sdk/agentutil"
+	"github.com/samber/lo"
 )
 
 // Tool names.
@@ -115,15 +116,17 @@ func ReadFileTool() fantasy.AgentTool {
 
 			stream := agentutil.NewSessionStream(ClientFrom(ctx), SessionFrom(ctx))
 			upd := acp.UpdateToolCallDelta(acp.ToolCallID(tc.ID))
+
+			ext := filepath.Ext(in.Path)
+			lang := strings.TrimPrefix(ext, ".")
+			wrapped := fmt.Sprintf("```%s\n%s\n```", lang, resp.Content)
+
 			upd.ToolCallUpdate.Locations = []acp.ToolCallLocation{{Path: in.Path, Line: in.Line}}
+			upd.ToolCallUpdate.Content = []acp.ToolCallContent{acp.ToolContent(acp.TextBlock(wrapped))}
+			upd.ToolCallUpdate.RawInput = in
 			stream.SendUpdate(ctx, upd)
 
-			r := fantasy.NewTextResponse("```\n" + resp.Content + "\n```")
-			meta, _ := json.Marshal(acp.ToolCallUpdate{
-				Locations: []acp.ToolCallLocation{{Path: in.Path, Line: in.Line}},
-				Content:   []acp.ToolCallContent{acp.ToolContent(acp.TextBlock(resp.Content))},
-			})
-			r.Metadata = string(meta)
+			r := fantasy.NewTextResponse(resp.Content)
 			return r, nil
 		},
 	)
@@ -163,14 +166,19 @@ func WriteFileTool() fantasy.AgentTool {
 			stream := agentutil.NewSessionStream(client, sid)
 			upd := acp.UpdateToolCallDelta(acp.ToolCallID(tc.ID))
 			upd.ToolCallUpdate.Locations = []acp.ToolCallLocation{{Path: in.Path}}
-			upd.ToolCallUpdate.Content = []acp.ToolCallContent{acp.ToolDiff(in.Path, in.Content, oldContent)}
+			upd.ToolCallUpdate.RawInput = in
+			if oldContent != "" {
+				upd.ToolCallUpdate.Content = []acp.ToolCallContent{acp.ToolDiff(in.Path, in.Content, oldContent)}
+			} else {
+				ext := filepath.Ext(in.Path)
+				lang := strings.TrimPrefix(ext, ".")
+				wrapped := fmt.Sprintf("```%s\n%s\n```", lang, in.Content)
+				upd.ToolCallUpdate.Content = []acp.ToolCallContent{acp.ToolContent(acp.TextBlock(wrapped))}
+			}
 			stream.SendUpdate(ctx, upd)
 
 			r := fantasy.NewTextResponse("File written successfully.")
-			meta, _ := json.Marshal(acp.ToolCallUpdate{
-				Locations: []acp.ToolCallLocation{{Path: in.Path}},
-				Content:   []acp.ToolCallContent{acp.ToolDiff(in.Path, in.Content, oldContent)},
-			})
+			meta, _ := json.Marshal(upd.ToolCallUpdate)
 			r.Metadata = string(meta)
 			return r, nil
 		},
@@ -368,11 +376,19 @@ func PlanTool() fantasy.AgentTool {
 	return fantasy.NewParallelAgentTool(
 		ToolNamePlan,
 		"Declare an ordered plan for multi-step tasks. Always use this for work involving more than a single step.",
-		func(ctx context.Context, in PlanInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
+		func(ctx context.Context, in PlanInput, tc fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			stream := agentutil.NewSessionStream(ClientFrom(ctx), SessionFrom(ctx))
 			if err := stream.SendPlan(ctx, in.Entries); err != nil {
 				return fantasy.NewTextErrorResponse(err.Error()), nil
 			}
+			md := strings.Join(lo.Map(in.Entries, func(e acp.PlanEntry, _ int) string {
+				return fmt.Sprintf("- [%s] %s  *(%s)*", lo.Ternary(e.Status == "completed", "x", " "), e.Content, e.Priority)
+			}), "\n")
+			upd := acp.UpdateToolCallDelta(acp.ToolCallID(tc.ID))
+			upd.ToolCallUpdate.Content = []acp.ToolCallContent{acp.ToolContent(acp.TextBlock(md))}
+			upd.ToolCallUpdate.RawInput = in
+			stream.SendUpdate(ctx, upd)
+
 			raw, _ := json.Marshal(in.Entries)
 			return fantasy.NewTextResponse(string(raw)), nil
 		},

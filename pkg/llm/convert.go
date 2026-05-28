@@ -224,7 +224,7 @@ func MessageToACP(msg fantasy.Message) []acp.SessionUpdate {
 					status := acp.ToolFailed
 					u.ToolCallUpdate.Status = &status
 				case fantasy.ToolResultOutputContentMedia:
-					u.ToolCallUpdate.RawOutput = r.Text
+					u.ToolCallUpdate.RawOutput = r.Data
 					status := acp.ToolCompleted
 					u.ToolCallUpdate.Status = &status
 				}
@@ -233,6 +233,26 @@ func MessageToACP(msg fantasy.Message) []acp.SessionUpdate {
 		}
 	}
 	return updates
+}
+
+// ToolResultToACP converts a Fantasy tool result into an ACP tool_call_update.
+func ToolResultToACP(tr fantasy.ToolResultContent) acp.SessionUpdate {
+	u := acp.UpdateToolCallDelta(tr.ToolCallID)
+	switch r := tr.Result.(type) {
+	case fantasy.ToolResultOutputContentText:
+		u.ToolCallUpdate.RawOutput = r.Text
+		status := acp.ToolCompleted
+		u.ToolCallUpdate.Status = &status
+	case fantasy.ToolResultOutputContentError:
+		u.ToolCallUpdate.RawOutput = r.Error.Error()
+		status := acp.ToolFailed
+		u.ToolCallUpdate.Status = &status
+	case fantasy.ToolResultOutputContentMedia:
+		u.ToolCallUpdate.RawOutput = r.Data
+		status := acp.ToolCompleted
+		u.ToolCallUpdate.Status = &status
+	}
+	return u
 }
 
 // usageToACP maps Fantasy Usage to ACP Usage.
