@@ -63,6 +63,7 @@ func run(ctx context.Context) error {
 			llm.WriteFileTool(),
 			llm.TerminalTool(),
 			llm.PlanTool(),
+			llm.EditTool(),
 		),
 	)
 

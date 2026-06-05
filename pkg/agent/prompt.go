@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -83,10 +82,9 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 			return stream.StartToolCall(ctx, acp.ToolCallID(id), toolName, kind)
 		},
 		OnToolCall: func(tc fantasy.ToolCallContent) error {
-			title := llm.TitleForTool(tc.ToolName, string(tc.Input), sess.CWD)
 			status := acp.ToolInProgress
 			update := acp.UpdateToolCallDelta(tc.ToolCallID)
-			update.ToolCallUpdate.Title = title
+			update.ToolCallUpdate.Title = tc.ToolName
 			update.ToolCallUpdate.Status = &status
 			return stream.SendUpdate(ctx, update)
 		},
@@ -104,17 +102,9 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 	}
 
 	for _, step := range result.Steps {
-		for _, msg := range step.Messages {
-			for _, upd := range llm.MessageToACP(msg) {
-				// Enrich tool call titles using the exported helper.
-				if upd.ToolCall != nil {
-					input, _ := json.Marshal(upd.ToolCall.RawInput)
-					title := llm.TitleForTool(string(upd.ToolCall.Title), string(input), sess.CWD)
-					upd.ToolCall.Title = title
-				}
-				if head, err = a.store.Append(ctx, req.SessionID, upd, head); err != nil {
-					return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
-				}
+		for _, upd := range llm.StepToACP(step.Messages, sess.CWD) {
+			if head, err = a.store.Append(ctx, req.SessionID, upd, head); err != nil {
+				return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
 			}
 		}
 	}

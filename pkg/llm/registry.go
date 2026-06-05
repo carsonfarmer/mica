@@ -75,9 +75,9 @@ func (r *Registry) Providers() []acp.ProviderInfo {
 	for _, ent := range r.providers {
 		out = append(out, acp.ProviderInfo{
 			ID:        string(ent.catwalk.ID),
-			Supported: []acp.LlmProtocol{catwalkTypeToACP(ent.catwalk.Type)},
+			Supported: []acp.LlmProtocol{TypeToACP(ent.catwalk.Type)},
 			Current: &acp.ProviderCurrentConfig{
-				APIType: catwalkTypeToACP(ent.catwalk.Type),
+				APIType: TypeToACP(ent.catwalk.Type),
 				BaseURL: ent.catwalk.APIEndpoint,
 			},
 		})

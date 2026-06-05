@@ -10,8 +10,6 @@ import (
 	"charm.land/fantasy/providers/openaicompat"
 )
 
-// TODO: We probably need a "provider options" method that helps us wire
-// up things like thought levels/reasoning levels, and other default provider settings
 func newFantasyProvider(cw catwalk.Provider) (fantasy.Provider, error) {
 	key := cw.APIKey
 	if after, ok := strings.CutPrefix(key, "$"); ok {
