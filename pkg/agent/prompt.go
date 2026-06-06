@@ -2,7 +2,9 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"charm.land/fantasy"
@@ -17,11 +19,12 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 		return nil, acp.NewRPCError(acp.ErrInvalidParams, "session not found")
 	}
 
-	ctx = a.cancellers.Begin(ctx, req.SessionID)
-	defer a.cancellers.End(req.SessionID)
+	ctx, token := a.cancellers.Begin(ctx, req.SessionID)
+	defer token.Done()
 
 	ctx = llm.WithClient(ctx, client)
 	ctx = llm.WithSession(ctx, req.SessionID)
+	ctx = llm.WithCWD(ctx, sess.CWD)
 
 	model, err := a.reg.Resolve(ctx, sess.Model)
 	if err != nil {
@@ -47,15 +50,15 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 	history := llm.UpdatesToMessages(prevEvents)
 	history = append(history, userMsg)
 
-	// Persist user message directly from the prompt blocks.
 	for _, b := range req.Prompt {
-		upd := acp.UpdateUserMessage(b, userMsgID)
+		upd := acp.UpdateUserMessage(b, acp.WithMessageID(userMsgID))
 		if head, err = a.store.Append(ctx, req.SessionID, upd, head); err != nil {
 			return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
 		}
 	}
 
 	stream := agentutil.NewSessionStream(a.bc, req.SessionID)
+	ctx = llm.WithStream(ctx, stream)
 
 	agentOpts := []fantasy.AgentOption{
 		fantasy.WithSystemPrompt(fmt.Sprintf(SystemPrompt, req.SessionID, sess.CWD)),
@@ -68,28 +71,71 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 
 	providerOpts := a.reg.ProviderOptions(sess.Model, sess.ThoughtLevel)
 
+	var textBufs = map[string]*strings.Builder{}
+
 	call := fantasy.AgentStreamCall{
 		Messages:        history,
 		ProviderOptions: providerOpts,
+
 		OnTextDelta: func(id, text string) error {
-			return stream.SendText(ctx, text, id)
+			b, ok := textBufs[id]
+			if !ok {
+				b = &strings.Builder{}
+				textBufs[id] = b
+			}
+			b.WriteString(text)
+			return stream.SendText(ctx, text)
+		},
+		OnTextEnd: func(id string) error {
+			buf, ok := textBufs[id]
+			if !ok {
+				return nil
+			}
+			delete(textBufs, id)
+			upd := acp.UpdateAgentMessage(acp.TextBlock(buf.String()), acp.WithMessageID(id))
+			head, err = a.store.Append(ctx, req.SessionID, upd, head)
+			return err
 		},
 		OnReasoningDelta: func(id, text string) error {
-			return stream.SendThought(ctx, text, id)
+			return stream.SendThought(ctx, text)
 		},
-		OnToolInputStart: func(id, toolName string) error {
-			kind := llm.ToolNameToACP(toolName)
-			return stream.StartToolCall(ctx, acp.ToolCallID(id), toolName, kind)
+		OnReasoningEnd: func(id string, rc fantasy.ReasoningContent) error {
+			upd := acp.UpdateAgentThought(acp.TextBlock(rc.Text), acp.WithMessageID(id))
+			head, err = a.store.Append(ctx, req.SessionID, upd, head)
+			return err
 		},
 		OnToolCall: func(tc fantasy.ToolCallContent) error {
-			status := acp.ToolInProgress
-			update := acp.UpdateToolCallDelta(tc.ToolCallID)
-			update.ToolCallUpdate.Title = tc.ToolName
-			update.ToolCallUpdate.Status = &status
-			return stream.SendUpdate(ctx, update)
+			kind := llm.ToolNameToACP(tc.ToolName)
+			upd := acp.UpdateToolCallStart(
+				acp.ToolCallID(tc.ToolCallID),
+				acp.WithTitle(tc.ToolName),
+				acp.WithKind(kind),
+				acp.WithRawInput(json.RawMessage(tc.Input)),
+			)
+			if err := stream.SendUpdate(ctx, upd); err != nil {
+				return err
+			}
+			head, err = a.store.Append(ctx, req.SessionID, upd, head)
+			return err
 		},
 		OnToolResult: func(tr fantasy.ToolResultContent) error {
-			return stream.SendUpdate(ctx, llm.ToolResultToACP(tr))
+			if tr.ClientMetadata == "" {
+				return nil
+			}
+			var updates []acp.SessionUpdate
+			if err := json.Unmarshal([]byte(tr.ClientMetadata), &updates); err != nil {
+				return err
+			}
+			for _, upd := range updates {
+				if err := stream.SendUpdate(ctx, upd); err != nil {
+					return err
+				}
+				head, err = a.store.Append(ctx, req.SessionID, upd, head)
+				if err != nil {
+					return err
+				}
+			}
+			return nil
 		},
 	}
 
@@ -99,14 +145,6 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 			return &acp.PromptResponse{StopReason: acp.StopCancelled, UserMessageID: userMsgID}, nil
 		}
 		return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
-	}
-
-	for _, step := range result.Steps {
-		for _, upd := range llm.StepToACP(step.Messages, sess.CWD) {
-			if head, err = a.store.Append(ctx, req.SessionID, upd, head); err != nil {
-				return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
-			}
-		}
 	}
 
 	stopReason := llm.FinishReasonToACP(result.Response.FinishReason)
@@ -127,7 +165,6 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 	if usage != nil {
 		turnCost := computeCost(cfg, usage)
 
-		// Accumulate into session totals.
 		accumulateUsage(&sess.TotalUsage, usage)
 		if turnCost != nil {
 			if sess.TotalCost == nil {
@@ -137,7 +174,6 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 		}
 		a.store.Set(ctx, req.SessionID, sess)
 
-		// Send cumulative usage to client.
 		size := uint64(cfg.ContextWindow)
 		upd := acp.UpdateUsage(sess.TotalUsage.TotalTokens, size, sess.TotalCost)
 		if head, err = a.store.Append(ctx, req.SessionID, upd, head); err != nil {

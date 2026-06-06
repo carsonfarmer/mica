@@ -2,7 +2,7 @@ package llm
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
 
 	"charm.land/catwalk/pkg/catwalk"
 	"charm.land/fantasy"
@@ -16,11 +16,11 @@ func UpdatesToMessages(updates []acp.SessionUpdate) []fantasy.Message {
 	for _, u := range updates {
 		switch {
 		case u.UserMessageChunk != nil:
-			if p := blockToPart(u.UserMessageChunk.Content); p != nil {
+			if p := contentBlockToMessagePart(u.UserMessageChunk.Content); p != nil {
 				msgs = append(msgs, fantasy.Message{Role: fantasy.MessageRoleUser, Content: []fantasy.MessagePart{p}})
 			}
 		case u.AgentMessageChunk != nil:
-			if p := blockToPart(u.AgentMessageChunk.Content); p != nil {
+			if p := contentBlockToMessagePart(u.AgentMessageChunk.Content); p != nil {
 				msgs = append(msgs, fantasy.Message{Role: fantasy.MessageRoleAssistant, Content: []fantasy.MessagePart{p}})
 			}
 		case u.AgentThoughtChunk != nil:
@@ -29,11 +29,11 @@ func UpdatesToMessages(updates []acp.SessionUpdate) []fantasy.Message {
 				Content: []fantasy.MessagePart{fantasy.ReasoningPart{Text: u.AgentThoughtChunk.Content.Text.Text}},
 			})
 		case u.ToolCall != nil:
-			if m := convertToolCall(u.ToolCall); m != nil {
+			if m := toolCallToMessage(u.ToolCall); m != nil {
 				msgs = append(msgs, *m)
 			}
 		case u.ToolCallUpdate != nil:
-			if m := convertToolCallUpdate(u.ToolCallUpdate); m != nil {
+			if m := toolCallUpdateToMessage(u.ToolCallUpdate); m != nil {
 				msgs = append(msgs, *m)
 			}
 		}
@@ -41,58 +41,29 @@ func UpdatesToMessages(updates []acp.SessionUpdate) []fantasy.Message {
 	return msgs
 }
 
-func convertToolCall(tc *acp.SessionUpdateToolCall) *fantasy.Message {
-	input, _ := json.Marshal(tc.RawInput)
-	toolName := kindToName(tc)
-	if toolName == "" {
+func toolCallToMessage(tc *acp.SessionUpdateToolCall) *fantasy.Message {
+	// Title is the tool name, set by UpdateToolCallStart in OnToolCall.
+	// Only ToolCallUpdate (deltas) modify Title for display purposes.
+	if tc.Title == "" {
 		return nil
 	}
+	input, _ := json.Marshal(tc.RawInput)
 	return &fantasy.Message{
 		Role: fantasy.MessageRoleAssistant,
 		Content: []fantasy.MessagePart{
-			fantasy.ToolCallPart{ToolCallID: tc.ToolCallID, ToolName: toolName, Input: string(input)},
+			fantasy.ToolCallPart{ToolCallID: tc.ToolCallID, ToolName: tc.Title, Input: string(input)},
 		},
 	}
 }
 
-func kindToName(tc *acp.SessionUpdateToolCall) string {
-	if tc.Kind == nil {
-		return ""
+func toolCallUpdateToMessage(tu *acp.SessionUpdateToolCallUpdate) *fantasy.Message {
+	s, ok := tu.RawOutput.(string)
+	if !ok {
+		return nil
 	}
-	switch *tc.Kind {
-	case acp.ToolRead:
-		return ToolNameReadFile
-	case acp.ToolEdit:
-		return editOrWrite(tc.RawInput)
-	case acp.ToolExecute:
-		return ToolNameExecuteCommand
-	case acp.ToolThink:
-		return ToolNamePlan
-	default:
-		return ""
-	}
-}
-
-func editOrWrite(raw any) string {
-	b, _ := json.Marshal(raw)
-	var v struct{ Edits []Edit `json:"edits"` }
-	if json.Unmarshal(b, &v) == nil && len(v.Edits) > 0 {
-		return ToolNameEdit
-	}
-	return ToolNameWriteFile
-}
-
-func convertToolCallUpdate(tu *acp.SessionUpdateToolCallUpdate) *fantasy.Message {
-	var result fantasy.ToolResultOutputContent
-	switch {
-	case tu.Status != nil && *tu.Status == acp.ToolFailed:
-		result = fantasy.ToolResultOutputContentError{Error: fmt.Errorf("tool call failed")}
-	case tu.RawOutput != nil:
-		if s, ok := tu.RawOutput.(string); ok {
-			result = fantasy.ToolResultOutputContentText{Text: s}
-		}
-	case len(tu.Content) > 0:
-		result = contentToResult(tu.Content)
+	result := fantasy.ToolResultOutputContent(fantasy.ToolResultOutputContentText{Text: s})
+	if tu.Status != nil && *tu.Status == acp.ToolFailed {
+		result = fantasy.ToolResultOutputContentError{Error: errors.New(s)}
 	}
 	return &fantasy.Message{
 		Role: fantasy.MessageRoleTool,
@@ -102,33 +73,11 @@ func convertToolCallUpdate(tu *acp.SessionUpdateToolCallUpdate) *fantasy.Message
 	}
 }
 
-func contentToResult(blocks []acp.ToolCallContent) fantasy.ToolResultOutputContent {
-	for _, b := range blocks {
-		if b.Content != nil {
-			switch {
-			case b.Content.Content.Text != nil:
-				return fantasy.ToolResultOutputContentText{Text: b.Content.Content.Text.Text}
-			case b.Content.Content.Image != nil:
-				return fantasy.ToolResultOutputContentMedia{
-					Data:      b.Content.Content.Image.Data,
-					MediaType: b.Content.Content.Image.MimeType,
-				}
-			}
-		}
-		if b.Diff != nil || b.Terminal != nil {
-			if raw, err := json.Marshal(b); err == nil {
-				return fantasy.ToolResultOutputContentText{Text: string(raw)}
-			}
-		}
-	}
-	return nil
-}
-
 // PromptToMessage converts ACP content blocks into a Fantasy user message.
 func PromptToMessage(blocks []acp.ContentBlock) (fantasy.Message, bool) {
 	parts := make([]fantasy.MessagePart, 0, len(blocks))
 	for _, b := range blocks {
-		if p := blockToPart(b); p != nil {
+		if p := contentBlockToMessagePart(b); p != nil {
 			parts = append(parts, p)
 		}
 	}
@@ -138,7 +87,7 @@ func PromptToMessage(blocks []acp.ContentBlock) (fantasy.Message, bool) {
 	return fantasy.Message{Role: fantasy.MessageRoleUser, Content: parts}, true
 }
 
-func blockToPart(b acp.ContentBlock) fantasy.MessagePart {
+func contentBlockToMessagePart(b acp.ContentBlock) fantasy.MessagePart {
 	switch {
 	case b.Text != nil:
 		return fantasy.TextPart{Text: b.Text.Text}
@@ -147,65 +96,33 @@ func blockToPart(b acp.ContentBlock) fantasy.MessagePart {
 			Data:      []byte(b.Image.Data),
 			MediaType: b.Image.MimeType,
 		}
-	}
-	return nil
-}
-
-// StepToACP converts a sequence of Fantasy messages into ACP session updates
-// for persistence. Tool calls and results are stored with minimal metadata;
-// rich display content is owned by the tool handlers during live streaming.
-func StepToACP(msgs []fantasy.Message, _ string) []acp.SessionUpdate {
-	var updates []acp.SessionUpdate
-
-	for _, msg := range msgs {
-		switch msg.Role {
-		case fantasy.MessageRoleUser:
-			for _, p := range msg.Content {
-				switch p := p.(type) {
-				case fantasy.TextPart:
-					updates = append(updates, acp.UpdateUserMessage(acp.TextBlock(p.Text)))
-				case fantasy.FilePart:
-					updates = append(updates, acp.UpdateUserMessage(acp.ImageBlock(string(p.Data), p.MediaType)))
-				}
+	case b.Resource != nil:
+		switch {
+		case b.Resource.Resource.Text != nil:
+			return fantasy.FilePart{
+				Data:      []byte(b.Resource.Resource.Text.Text),
+				MediaType: b.Resource.Resource.Text.MimeType,
 			}
-		case fantasy.MessageRoleAssistant:
-			for _, p := range msg.Content {
-				switch p := p.(type) {
-				case fantasy.TextPart:
-					updates = append(updates, acp.UpdateAgentMessage(acp.TextBlock(p.Text)))
-				case fantasy.ReasoningPart:
-					updates = append(updates, acp.UpdateAgentThought(acp.TextBlock(p.Text)))
-				case fantasy.ToolCallPart:
-					u := acp.UpdateToolCallStart(p.ToolCallID, p.ToolName)
-					u.ToolCall.RawInput = json.RawMessage(p.Input)
-					kind := ToolNameToACP(p.ToolName)
-					u.ToolCall.Kind = &kind
-					updates = append(updates, u)
-				}
-			}
-		case fantasy.MessageRoleTool:
-			for _, p := range msg.Content {
-				p, ok := p.(fantasy.ToolResultPart)
-				if !ok {
-					continue
-				}
-				u := acp.UpdateToolCallDelta(acp.ToolCallID(p.ToolCallID))
-				setResult(u.ToolCallUpdate, p.Output)
-				updates = append(updates, u)
+		case b.Resource.Resource.Blob != nil:
+			return fantasy.FilePart{
+				Data:      []byte(b.Resource.Resource.Blob.Blob),
+				MediaType: b.Resource.Resource.Blob.MimeType,
 			}
 		}
+	case b.ResourceLink != nil:
+		return fantasy.TextPart{Text: b.ResourceLink.URI}
 	}
-	return updates
+	return nil
 }
 
 // ToolNameToACP returns the ACP ToolKind for a registered tool name.
 func ToolNameToACP(name string) acp.ToolKind {
 	switch name {
-	case ToolNameReadFile:
+	case ToolNameRead:
 		return acp.ToolRead
-	case ToolNameWriteFile, ToolNameEdit:
+	case ToolNameWrite, ToolNameEdit:
 		return acp.ToolEdit
-	case ToolNameExecuteCommand, ToolNameTerminalCreate, ToolNameTerminalOutput,
+	case ToolNameExecute, ToolNameTerminalCreate, ToolNameTerminalOutput,
 		ToolNameTerminalWait, ToolNameTerminalKill, ToolNameTerminalRelease:
 		return acp.ToolExecute
 	case ToolNamePlan:
@@ -252,30 +169,6 @@ func TypeToACP(t catwalk.Type) acp.LlmProtocol {
 		return acp.LlmProtocolOpenAI
 	default:
 		return acp.LlmProtocolOpenAICompat
-	}
-}
-
-// ToolResultToACP converts a Fantasy tool result into an ACP tool_call_update.
-func ToolResultToACP(tr fantasy.ToolResultContent) acp.SessionUpdate {
-	u := acp.UpdateToolCallDelta(tr.ToolCallID)
-	setResult(u.ToolCallUpdate, tr.Result)
-	return u
-}
-
-func setResult(u *acp.SessionUpdateToolCallUpdate, result fantasy.ToolResultOutputContent) {
-	switch r := result.(type) {
-	case fantasy.ToolResultOutputContentText:
-		u.RawOutput = r.Text
-		status := acp.ToolCompleted
-		u.Status = &status
-	case fantasy.ToolResultOutputContentError:
-		u.RawOutput = r.Error.Error()
-		status := acp.ToolFailed
-		u.Status = &status
-	case fantasy.ToolResultOutputContentMedia:
-		u.RawOutput = r.Data
-		status := acp.ToolCompleted
-		u.Status = &status
 	}
 }
 

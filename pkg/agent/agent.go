@@ -125,7 +125,7 @@ func (a *Agent) LoadSession(ctx context.Context, req *acp.LoadSessionRequest, cl
 
 func (a *Agent) CloseSession(_ context.Context, req *acp.CloseSessionRequest, client acp.Client) (*acp.CloseSessionResponse, error) {
 	a.bc.Unsubscribe(req.SessionID, client)
-	a.cancellers.End(req.SessionID)
+	a.cancellers.Cancel(req.SessionID)
 	return &acp.CloseSessionResponse{}, nil
 }
 
@@ -184,10 +184,10 @@ func (a *Agent) ForkSession(ctx context.Context, req *acp.ForkSessionRequest, cl
 }
 
 var (
-	_ acp.Agent                = (*Agent)(nil)
-	_ acp.AgentSessionLoader   = (*Agent)(nil)
-	_ acp.AgentSessionCloser   = (*Agent)(nil)
-	_ acp.AgentSessionLister   = (*Agent)(nil)
-	_ acp.AgentSessionResumer  = (*Agent)(nil)
-	_ acp.AgentSessionForker   = (*Agent)(nil)
+	_ acp.Agent               = (*Agent)(nil)
+	_ acp.AgentSessionLoader  = (*Agent)(nil)
+	_ acp.AgentSessionCloser  = (*Agent)(nil)
+	_ acp.AgentSessionLister  = (*Agent)(nil)
+	_ acp.AgentSessionResumer = (*Agent)(nil)
+	_ acp.AgentSessionForker  = (*Agent)(nil)
 )

@@ -7,7 +7,6 @@ import (
 
 	"charm.land/fantasy"
 	"github.com/carsonfarmer/go-acp-sdk"
-	"github.com/carsonfarmer/go-acp-sdk/agentutil"
 )
 
 const ToolNamePlan = "plan"
@@ -23,11 +22,6 @@ func PlanTool() fantasy.AgentTool {
 		ToolNamePlan,
 		"Declare an ordered plan for multi-step tasks. Always use this for work involving more than a single step.",
 		func(ctx context.Context, in PlanInput, tc fantasy.ToolCall) (fantasy.ToolResponse, error) {
-			stream := agentutil.NewSessionStream(ClientFrom(ctx), SessionFrom(ctx))
-			if err := stream.SendPlan(ctx, in.Entries); err != nil {
-				return fantasy.NewTextErrorResponse(err.Error()), nil
-			}
-			upd := acp.UpdateToolCallDelta(acp.ToolCallID(tc.ID))
 			var b strings.Builder
 			for _, e := range in.Entries {
 				s := " "
@@ -36,11 +30,18 @@ func PlanTool() fantasy.AgentTool {
 				}
 				fmt.Fprintf(&b, "- [%s] (*%s*) %s  **(%s)**\n", s, e.Status, e.Content, e.Priority)
 			}
-			upd.ToolCallUpdate.RawInput = in
-			upd.ToolCallUpdate.Content = []acp.ToolCallContent{acp.ToolContent(acp.TextBlock(b.String()))}
-			stream.SendUpdate(ctx, upd)
 
-			return fantasy.NewTextResponse("plan updated"), nil
+			planUpd := acp.UpdatePlan(in.Entries...)
+			toolUpd := acp.UpdateToolCallDelta(
+				acp.ToolCallID(tc.ID),
+				acp.WithTitle(ToolNamePlan),
+				acp.WithStatus(acp.ToolCompleted),
+				acp.WithRawOutput("plan updated"),
+				acp.WithRawInput(in),
+				acp.WithToolContent(acp.ToolContent(acp.TextBlock(b.String()))),
+			)
+
+			return ToolResponse("plan updated", planUpd, toolUpd), nil
 		},
 	)
 }

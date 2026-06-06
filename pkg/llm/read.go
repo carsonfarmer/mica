@@ -7,7 +7,7 @@ import (
 	"github.com/carsonfarmer/go-acp-sdk"
 )
 
-const ToolNameReadFile = "read_file"
+const ToolNameRead = "read"
 
 // ReadFileInput is the input for the read_file tool.
 type ReadFileInput struct {
@@ -19,7 +19,7 @@ type ReadFileInput struct {
 // ReadFileTool creates a tool that reads a file via the ACP client.
 func ReadFileTool() fantasy.AgentTool {
 	return fantasy.NewParallelAgentTool(
-		ToolNameReadFile,
+		ToolNameRead,
 		"Read a file from the local filesystem.",
 		func(ctx context.Context, in ReadFileInput, tc fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			resp, err := ClientFrom(ctx).ReadTextFile(ctx, &acp.ReadTextFileRequest{
@@ -29,16 +29,19 @@ func ReadFileTool() fantasy.AgentTool {
 				Limit:     in.Limit,
 			})
 			if err != nil {
-				return fantasy.NewTextErrorResponse(err.Error()), nil
+				return ToolFailedResponse(tc, err), nil
 			}
 
-			upd := acp.UpdateToolCallDelta(acp.ToolCallID(tc.ID))
-			upd.ToolCallUpdate.RawInput = in
-			upd.ToolCallUpdate.Locations = []acp.ToolCallLocation{{Path: in.Path, Line: in.Line}}
-			upd.ToolCallUpdate.Content = []acp.ToolCallContent{acp.ToolContent(acp.TextBlock(WrapCodeBlock(in.Path, resp.Content)))}
-			ClientFrom(ctx).SessionUpdate(ctx, &acp.SessionNotification{SessionID: SessionFrom(ctx), Update: upd})
-
-			return fantasy.NewTextResponse(resp.Content), nil
+			upd := acp.UpdateToolCallDelta(
+				acp.ToolCallID(tc.ID),
+				acp.WithStatus(acp.ToolCompleted),
+				acp.WithTitle(ToolNameRead+" "+RelPath(ctx, in.Path)),
+				acp.WithRawOutput(resp.Content),
+				acp.WithRawInput(in),
+				acp.WithLocations(acp.ToolCallLocation{Path: in.Path, Line: in.Line}),
+				acp.WithToolContent(acp.ToolContent(acp.TextBlock(WrapCodeBlock(in.Path, resp.Content)))),
+			)
+			return ToolResponse(resp.Content, upd), nil
 		},
 	)
 }
