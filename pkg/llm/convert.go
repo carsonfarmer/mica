@@ -24,10 +24,9 @@ func UpdatesToMessages(updates []acp.SessionUpdate) []fantasy.Message {
 				msgs = append(msgs, fantasy.Message{Role: fantasy.MessageRoleAssistant, Content: []fantasy.MessagePart{p}})
 			}
 		case u.AgentThoughtChunk != nil:
-			msgs = append(msgs, fantasy.Message{
-				Role:    fantasy.MessageRoleAssistant,
-				Content: []fantasy.MessagePart{fantasy.ReasoningPart{Text: u.AgentThoughtChunk.Content.Text.Text}},
-			})
+			if m := thoughtChunkToMessage(u.AgentThoughtChunk); m != nil {
+				msgs = append(msgs, *m)
+			}
 		case u.ToolCall != nil:
 			if m := toolCallToMessage(u.ToolCall); m != nil {
 				msgs = append(msgs, *m)
@@ -39,6 +38,16 @@ func UpdatesToMessages(updates []acp.SessionUpdate) []fantasy.Message {
 		}
 	}
 	return msgs
+}
+
+func thoughtChunkToMessage(tc *acp.SessionUpdateAgentThoughtChunk) *fantasy.Message {
+	if tc.Content.Text == nil {
+		return nil
+	}
+	return &fantasy.Message{
+		Role:    fantasy.MessageRoleAssistant,
+		Content: []fantasy.MessagePart{fantasy.ReasoningPart{Text: tc.Content.Text.Text}},
+	}
 }
 
 func toolCallToMessage(tc *acp.SessionUpdateToolCall) *fantasy.Message {
@@ -57,10 +66,7 @@ func toolCallToMessage(tc *acp.SessionUpdateToolCall) *fantasy.Message {
 }
 
 func toolCallUpdateToMessage(tu *acp.SessionUpdateToolCallUpdate) *fantasy.Message {
-	s, ok := tu.RawOutput.(string)
-	if !ok {
-		return nil
-	}
+	s := tu.RawOutput.(string)
 	result := fantasy.ToolResultOutputContent(fantasy.ToolResultOutputContentText{Text: s})
 	if tu.Status != nil && *tu.Status == acp.ToolFailed {
 		result = fantasy.ToolResultOutputContentError{Error: errors.New(s)}
@@ -92,22 +98,13 @@ func contentBlockToMessagePart(b acp.ContentBlock) fantasy.MessagePart {
 	case b.Text != nil:
 		return fantasy.TextPart{Text: b.Text.Text}
 	case b.Image != nil:
-		return fantasy.FilePart{
-			Data:      []byte(b.Image.Data),
-			MediaType: b.Image.MimeType,
-		}
+		return fantasy.FilePart{Data: []byte(b.Image.Data), MediaType: b.Image.MimeType}
 	case b.Resource != nil:
-		switch {
-		case b.Resource.Resource.Text != nil:
-			return fantasy.FilePart{
-				Data:      []byte(b.Resource.Resource.Text.Text),
-				MediaType: b.Resource.Resource.Text.MimeType,
-			}
-		case b.Resource.Resource.Blob != nil:
-			return fantasy.FilePart{
-				Data:      []byte(b.Resource.Resource.Blob.Blob),
-				MediaType: b.Resource.Resource.Blob.MimeType,
-			}
+		if r := b.Resource.Resource.Text; r != nil {
+			return fantasy.FilePart{Data: []byte(r.Text), MediaType: r.MimeType}
+		}
+		if r := b.Resource.Resource.Blob; r != nil {
+			return fantasy.FilePart{Data: []byte(r.Blob), MediaType: r.MimeType}
 		}
 	case b.ResourceLink != nil:
 		return fantasy.TextPart{Text: b.ResourceLink.URI}
@@ -135,16 +132,12 @@ func ToolNameToACP(name string) acp.ToolKind {
 // FinishReasonToACP maps Fantasy finish reasons to ACP stop reasons.
 func FinishReasonToACP(fr fantasy.FinishReason) acp.StopReason {
 	switch fr {
-	case fantasy.FinishReasonStop:
+	case fantasy.FinishReasonStop, fantasy.FinishReasonToolCalls, fantasy.FinishReasonError:
 		return acp.StopEndTurn
 	case fantasy.FinishReasonLength:
 		return acp.StopMaxTokens
-	case fantasy.FinishReasonToolCalls:
-		return acp.StopEndTurn
 	case fantasy.FinishReasonContentFilter:
 		return acp.StopRefusal
-	case fantasy.FinishReasonError:
-		return acp.StopEndTurn
 	default:
 		return acp.StopEndTurn
 	}

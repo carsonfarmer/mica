@@ -33,9 +33,9 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 
 	cfg, _ := a.reg.Config(sess.Model)
 
-	userMsgID := req.MessageID
-	if userMsgID == "" {
-		userMsgID = acp.NewUUID()
+	userMessageID := req.MessageID
+	if userMessageID == "" {
+		userMessageID = acp.NewUUID()
 	}
 
 	userMsg, ok := llm.PromptToMessage(req.Prompt)
@@ -51,7 +51,7 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 	history = append(history, userMsg)
 
 	for _, b := range req.Prompt {
-		upd := acp.UpdateUserMessage(b, acp.WithMessageID(userMsgID))
+		upd := acp.UpdateUserMessage(b, acp.WithMessageID(userMessageID))
 		if head, err = a.store.Append(ctx, req.SessionID, upd, head); err != nil {
 			return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
 		}
@@ -71,28 +71,20 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 
 	providerOpts := a.reg.ProviderOptions(sess.Model, sess.ThoughtLevel)
 
-	var textBufs = map[string]*strings.Builder{}
+	var textBuf strings.Builder
 
 	call := fantasy.AgentStreamCall{
 		Messages:        history,
 		ProviderOptions: providerOpts,
 
 		OnTextDelta: func(id, text string) error {
-			b, ok := textBufs[id]
-			if !ok {
-				b = &strings.Builder{}
-				textBufs[id] = b
-			}
-			b.WriteString(text)
+			textBuf.WriteString(text)
 			return stream.SendText(ctx, text)
 		},
 		OnTextEnd: func(id string) error {
-			buf, ok := textBufs[id]
-			if !ok {
-				return nil
-			}
-			delete(textBufs, id)
-			upd := acp.UpdateAgentMessage(acp.TextBlock(buf.String()), acp.WithMessageID(id))
+			s := textBuf.String()
+			textBuf.Reset()
+			upd := acp.UpdateAgentMessage(acp.TextBlock(s), acp.WithMessageID(id))
 			head, err = a.store.Append(ctx, req.SessionID, upd, head)
 			return err
 		},
@@ -142,7 +134,7 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 	result, err := fa.Stream(ctx, call)
 	if err != nil {
 		if ctx.Err() != nil {
-			return &acp.PromptResponse{StopReason: acp.StopCancelled, UserMessageID: userMsgID}, nil
+			return &acp.PromptResponse{StopReason: acp.StopCancelled, UserMessageID: userMessageID}, nil
 		}
 		return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
 	}
@@ -189,6 +181,6 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 	return &acp.PromptResponse{
 		StopReason:    stopReason,
 		Usage:         usage,
-		UserMessageID: userMsgID,
+		UserMessageID: userMessageID,
 	}, nil
 }
