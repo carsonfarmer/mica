@@ -10,7 +10,7 @@ import (
 	"charm.land/fantasy"
 	acp "github.com/carsonfarmer/go-acp-sdk"
 	"github.com/carsonfarmer/go-acp-sdk/agentutil"
-	"github.com/carsonfarmer/mica/pkg/llm"
+	"github.com/carsonfarmer/mica/pkg/core"
 )
 
 func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.Client) (*acp.PromptResponse, error) {
@@ -22,9 +22,8 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 	ctx, token := a.cancellers.Begin(ctx, req.SessionID)
 	defer token.Done()
 
-	ctx = llm.WithClient(ctx, client)
-	ctx = llm.WithSession(ctx, req.SessionID)
-	ctx = llm.WithCWD(ctx, sess.CWD)
+	ctx = core.WithClient(ctx, client)
+	ctx = core.WithSession(ctx, sess)
 
 	model, err := a.reg.Resolve(ctx, sess.Model)
 	if err != nil {
@@ -38,7 +37,7 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 		userMessageID = acp.NewUUID()
 	}
 
-	userMsg, ok := llm.PromptToMessage(req.Prompt)
+	userMsg, ok := core.PromptToMessage(req.Prompt)
 	if !ok {
 		return nil, acp.NewRPCError(acp.ErrInvalidParams, "empty prompt")
 	}
@@ -47,7 +46,7 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 	if err != nil {
 		return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
 	}
-	history := llm.UpdatesToMessages(prevEvents)
+	history := core.UpdatesToMessages(prevEvents)
 	history = append(history, userMsg)
 
 	for _, b := range req.Prompt {
@@ -55,13 +54,24 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 		if head, err = a.store.Append(ctx, req.SessionID, upd, head); err != nil {
 			return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
 		}
+		if err := a.bc.SendExcept(ctx, &acp.SessionNotification{
+			SessionID: req.SessionID,
+			Update:    upd,
+		}, client); err != nil {
+			return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
+		}
 	}
 
 	stream := agentutil.NewSessionStream(a.bc, req.SessionID)
-	ctx = llm.WithStream(ctx, stream)
+
+	var sysPrompt strings.Builder
+	fmt.Fprintf(&sysPrompt, SystemPrompt, req.SessionID, sess.SessionInfo.CWD)
+	for _, h := range sess.PromptHooks {
+		h(&sysPrompt)
+	}
 
 	agentOpts := []fantasy.AgentOption{
-		fantasy.WithSystemPrompt(fmt.Sprintf(SystemPrompt, req.SessionID, sess.CWD)),
+		fantasy.WithSystemPrompt(sysPrompt.String()),
 		fantasy.WithTools(a.tools...),
 	}
 	if cfg.DefaultMaxTokens > 0 {
@@ -97,7 +107,7 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 			return err
 		},
 		OnToolCall: func(tc fantasy.ToolCallContent) error {
-			kind := llm.ToolNameToACP(tc.ToolName)
+			kind := core.ToolNameToACP(tc.ToolName)
 			upd := acp.UpdateToolCallStart(
 				acp.ToolCallID(tc.ToolCallID),
 				acp.WithTitle(tc.ToolName),
@@ -139,8 +149,8 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 		return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
 	}
 
-	stopReason := llm.FinishReasonToACP(result.Response.FinishReason)
-	usage := llm.UsageToACP(result.Response.Usage)
+	stopReason := core.FinishReasonToACP(result.Response.FinishReason)
+	usage := core.UsageToACP(result.Response.Usage)
 
 	if len(req.Prompt) > 0 {
 		sess.SessionInfo.Title = agentutil.TitleFromPrompt(req.Prompt)
@@ -155,23 +165,23 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 	}
 
 	if usage != nil {
-		turnCost := computeCost(cfg, usage)
+		turnCost := core.ComputeCost(cfg, usage)
 
-		accumulateUsage(&sess.TotalUsage, usage)
+		core.AccumulateUsage(&sess.Usage, usage)
 		if turnCost != nil {
-			if sess.TotalCost == nil {
-				sess.TotalCost = &acp.Cost{Currency: "USD"}
+			if sess.Cost == nil {
+				sess.Cost = &acp.Cost{Currency: "USD"}
 			}
-			sess.TotalCost.Amount += turnCost.Amount
+			sess.Cost.Amount += turnCost.Amount
 		}
 		a.store.Set(ctx, req.SessionID, sess)
 
 		size := uint64(cfg.ContextWindow)
-		upd := acp.UpdateUsage(sess.TotalUsage.TotalTokens, size, sess.TotalCost)
+		upd := acp.UpdateUsage(sess.Usage.TotalTokens, size, sess.Cost)
 		if head, err = a.store.Append(ctx, req.SessionID, upd, head); err != nil {
 			return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
 		}
-		stream.SendUsageUpdate(ctx, sess.TotalUsage.TotalTokens, size, sess.TotalCost)
+		stream.SendUsageUpdate(ctx, sess.Usage.TotalTokens, size, sess.Cost)
 	}
 
 	if head != nil {

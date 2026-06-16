@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"time"
 
 	"charm.land/catwalk/pkg/embedded"
 	acp "github.com/carsonfarmer/go-acp-sdk"
@@ -15,11 +17,12 @@ import (
 	"github.com/carsonfarmer/go-acp-sdk/storage"
 	"github.com/carsonfarmer/go-acp-sdk/ws"
 	"github.com/carsonfarmer/mica/pkg/agent"
-	"github.com/carsonfarmer/mica/pkg/llm"
+	"github.com/carsonfarmer/mica/pkg/core"
+	"github.com/carsonfarmer/mica/pkg/tools"
 )
 
 var (
-	dataDir = flag.String("data", ".mica", "data directory for persistence")
+	dataDir = flag.String("data", "", "data directory for persistence (default ~/.mica)")
 	addr    = flag.String("http", ":8080", "HTTP address to listen on")
 )
 
@@ -35,41 +38,77 @@ func main() {
 	}
 }
 
+func isRunning(addr string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost"+addr+"/health", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
 func run(ctx context.Context) error {
+	wsEndpoint := fmt.Sprintf("ws://localhost%s/acp", *addr)
+
+	// Check if an existing instance is already running. If so, become a
+	// client instead of starting a new server.
+	if isRunning(*addr) {
+		log.Printf("found existing instance at localhost%s, running as client", *addr)
+		ws.Proxy(ctx, wsEndpoint)
+		return nil
+	}
+
+	// Resolve data dir to absolute so sessions are findable regardless of CWD.
+	d := *dataDir
+	if d == "" {
+		home, _ := os.UserHomeDir()
+		d = filepath.Join(home, ".mica")
+	}
+	absData, err := filepath.Abs(d)
+	if err != nil {
+		return fmt.Errorf("resolve data dir: %w", err)
+	}
+
 	all := embedded.GetAll()
 
-	reg := llm.NewRegistry()
+	reg := core.NewRegistry()
 	for _, cw := range all {
 		if err := reg.AddProvider(cw); err != nil {
 			log.Printf("skipping provider %s: %v", cw.ID, err)
 		}
 	}
 	def := reg.Default()
-	if def.Provider == "" {
+	if def == "" {
 		return fmt.Errorf("no providers configured; set at least one API key environment variable")
 	}
 	log.Printf("loaded %d provider(s), default model %s", len(reg.Providers()), def)
 
-	store, err := storage.NewTypedDirStore[*agent.AgentSession](*dataDir)
+	store, err := storage.NewTypedDirStore[*core.AgentSession](absData)
 	if err != nil {
 		return fmt.Errorf("create store: %w", err)
 	}
 	defer store.Close()
-	log.Printf("persisting sessions to %s", *dataDir)
+	log.Printf("persisting sessions to %s", absData)
 
 	ag := agent.New(reg, store,
 		agent.WithTools(
-			llm.ReadFileTool(),
-			llm.WriteFileTool(),
-			llm.TerminalTool(),
-			llm.PlanTool(),
-			llm.EditTool(),
+			tools.ReadTool(),
+			tools.WriteTool(),
+			tools.TerminalTool(),
+			tools.PlanTool(),
+			tools.EditTool(),
+			tools.CompactTool(store, reg),
 		),
 	)
 
-	endpoint := fmt.Sprintf("ws://localhost%s/acp", *addr)
-	log.Printf("stdio proxy relaying to %s", endpoint)
-	go func() { ws.Proxy(ctx, endpoint) }()
+	log.Printf("stdio proxy relaying to %s", wsEndpoint)
+	go func() { ws.Proxy(ctx, wsEndpoint) }()
 
 	mux := http.NewServeMux()
 	mux.Handle("/acp", ws.NewHandler(ag,

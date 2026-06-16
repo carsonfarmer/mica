@@ -1,4 +1,4 @@
-package llm
+package tools
 
 import (
 	"context"
@@ -8,9 +8,8 @@ import (
 
 	"charm.land/fantasy"
 	"github.com/carsonfarmer/go-acp-sdk"
+	"github.com/carsonfarmer/mica/pkg/core"
 )
-
-const ToolNameEdit = "edit"
 
 // Edit specifies a 1-based line replacement within a file. Start and End are
 // both inclusive. To replace line 5 alone: Start=5, End=5. To delete lines
@@ -27,39 +26,39 @@ type EditInput struct {
 	Edits []Edit `json:"edits" description:"One or more line-based replacements"`
 }
 
-// EditTool creates a tool that edits a file via line-based replacements.
+// EditTool applies 1-based line-range replacements to a file. Reads the
+// file first (silently treating missing as empty), applies edits sorted by
+// start line in a single left-to-right pass, then writes the result.
+// Produces a unified diff in the tool content.
 func EditTool() fantasy.AgentTool {
 	return fantasy.NewParallelAgentTool(
-		ToolNameEdit,
+		"edit",
 		"Edit a file with line-based replacements. Each edit specifies a line range (start, end) and replacement text.",
 		func(ctx context.Context, in EditInput, tc fantasy.ToolCall) (fantasy.ToolResponse, error) {
-			client := ClientFrom(ctx)
-			sid := SessionFrom(ctx)
-
+			if err := CheckPermission(ctx, tc, "edit:"+in.Path); err != nil {
+				return ToolErrorResponse(err.Error()), nil
+			}
+			info := core.SessionFrom(ctx).SessionInfo
 			var oldContent string
-			if resp, err := client.ReadTextFile(ctx, &acp.ReadTextFileRequest{
-				SessionID: sid, Path: in.Path,
+			if resp, err := core.ClientFrom(ctx).ReadTextFile(ctx, &acp.ReadTextFileRequest{
+				SessionID: info.SessionID, Path: in.Path,
 			}); err == nil {
 				oldContent = resp.Content
 			}
-
 			newContent, err := applyEdits(oldContent, in.Edits)
 			if err != nil {
 				return ToolFailedResponse(tc, err), nil
 			}
-
-			_, err = client.WriteTextFile(ctx, &acp.WriteTextFileRequest{
-				SessionID: sid, Path: in.Path, Content: newContent,
-			})
-			if err != nil {
+			if _, err = core.ClientFrom(ctx).WriteTextFile(ctx, &acp.WriteTextFileRequest{
+				SessionID: info.SessionID, Path: in.Path, Content: newContent,
+			}); err != nil {
 				return ToolFailedResponse(tc, err), nil
 			}
-
 			output := fmt.Sprintf("Successfully applied %d edit(s) to %s.", len(in.Edits), in.Path)
 			upd := acp.UpdateToolCallDelta(
 				acp.ToolCallID(tc.ID),
 				acp.WithStatus(acp.ToolCompleted),
-				acp.WithTitle(ToolNameEdit+" "+RelPath(ctx, in.Path)),
+				acp.WithTitle("edit"+" "+RelPath(info.CWD, in.Path)),
 				acp.WithRawOutput(output),
 				acp.WithRawInput(in),
 				acp.WithLocations(acp.ToolCallLocation{Path: in.Path}),
@@ -76,26 +75,22 @@ func applyEdits(content string, edits []Edit) (string, error) {
 	if len(edits) == 0 {
 		return "", fmt.Errorf("no edits provided")
 	}
-
 	lines := strings.Split(content, "\n")
 	sort.Slice(edits, func(i, j int) bool { return edits[i].Start < edits[j].Start })
-
 	var result []string
 	prev := 0
 	for i, e := range edits {
 		if e.Start < 1 || e.End > len(lines)+1 || e.Start > e.End {
 			return "", fmt.Errorf("edit %d: invalid line range [%d,%d] for file with %d lines", i, e.Start, e.End, len(lines))
 		}
-		start0 := e.Start - 1
-		end0 := e.End
-		if start0 < prev {
+		if e.Start-1 < prev {
 			return "", fmt.Errorf("edit %d: overlapping edits at line %d", i, e.Start)
 		}
-		result = append(result, lines[prev:start0]...)
+		result = append(result, lines[prev:e.Start-1]...)
 		if e.New != "" {
 			result = append(result, strings.Split(e.New, "\n")...)
 		}
-		prev = end0
+		prev = e.End
 	}
 	if prev < len(lines) {
 		result = append(result, lines[prev:]...)

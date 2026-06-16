@@ -1,41 +1,44 @@
-package llm
+package tools
 
 import (
 	"context"
+	"path/filepath"
 
 	"charm.land/fantasy"
 	"github.com/carsonfarmer/go-acp-sdk"
+	"github.com/carsonfarmer/mica/pkg/core"
 )
 
-const ToolNameRead = "read"
-
-// ReadFileInput is the input for the read_file tool.
-type ReadFileInput struct {
+// ReadInput is the input for the read tool.
+type ReadInput struct {
 	Path  string `json:"path" description:"Absolute path to the file to read"`
 	Line  int    `json:"line,omitempty" description:"Line number to start reading from (1-indexed)"`
 	Limit int    `json:"limit,omitempty" description:"Maximum number of lines to read"`
 }
 
-// ReadFileTool creates a tool that reads a file via the ACP client.
-func ReadFileTool() fantasy.AgentTool {
+// ReadTool reads a file. In safe mode, requests read permission on the
+// parent directory (folder-level gating). Returns the file content as text
+// wrapped in a markdown code block.
+func ReadTool() fantasy.AgentTool {
 	return fantasy.NewParallelAgentTool(
-		ToolNameRead,
+		"read",
 		"Read a file from the local filesystem.",
-		func(ctx context.Context, in ReadFileInput, tc fantasy.ToolCall) (fantasy.ToolResponse, error) {
-			resp, err := ClientFrom(ctx).ReadTextFile(ctx, &acp.ReadTextFileRequest{
-				SessionID: SessionFrom(ctx),
-				Path:      in.Path,
-				Line:      in.Line,
-				Limit:     in.Limit,
+		func(ctx context.Context, in ReadInput, tc fantasy.ToolCall) (fantasy.ToolResponse, error) {
+			if err := CheckPermission(ctx, tc, "read:"+filepath.Dir(in.Path)+"/"); err != nil {
+				return ToolErrorResponse(err.Error()), nil
+			}
+			info := core.SessionFrom(ctx).SessionInfo
+			resp, err := core.ClientFrom(ctx).ReadTextFile(ctx, &acp.ReadTextFileRequest{
+				SessionID: info.SessionID,
+				Path: in.Path, Line: in.Line, Limit: in.Limit,
 			})
 			if err != nil {
 				return ToolFailedResponse(tc, err), nil
 			}
-
 			upd := acp.UpdateToolCallDelta(
 				acp.ToolCallID(tc.ID),
 				acp.WithStatus(acp.ToolCompleted),
-				acp.WithTitle(ToolNameRead+" "+RelPath(ctx, in.Path)),
+				acp.WithTitle("read"+" "+RelPath(info.CWD, in.Path)),
 				acp.WithRawOutput(resp.Content),
 				acp.WithRawInput(in),
 				acp.WithLocations(acp.ToolCallLocation{Path: in.Path, Line: in.Line}),

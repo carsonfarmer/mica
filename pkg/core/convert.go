@@ -1,4 +1,4 @@
-package llm
+package core
 
 import (
 	"encoding/json"
@@ -115,14 +115,14 @@ func contentBlockToMessagePart(b acp.ContentBlock) fantasy.MessagePart {
 // ToolNameToACP returns the ACP ToolKind for a registered tool name.
 func ToolNameToACP(name string) acp.ToolKind {
 	switch name {
-	case ToolNameRead:
+	case "read":
 		return acp.ToolRead
-	case ToolNameWrite, ToolNameEdit:
+	case "write", "edit":
 		return acp.ToolEdit
-	case ToolNameExecute, ToolNameTerminalCreate, ToolNameTerminalOutput,
-		ToolNameTerminalWait, ToolNameTerminalKill, ToolNameTerminalRelease:
+	case "execute", "terminal_create", "terminal_output",
+		"terminal_wait", "terminal_kill", "terminal_release":
 		return acp.ToolExecute
-	case ToolNamePlan:
+	case "plan":
 		return acp.ToolThink
 	default:
 		return acp.ToolOther
