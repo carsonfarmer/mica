@@ -2,12 +2,10 @@ package agent
 
 import (
 	"context"
-	"fmt"
 
 	"charm.land/fantasy"
 	acp "github.com/carsonfarmer/go-acp-sdk"
 	"github.com/carsonfarmer/go-acp-sdk/agentutil"
-	acpmcp "github.com/carsonfarmer/go-acp-sdk/mcp"
 	"github.com/carsonfarmer/go-acp-sdk/storage"
 	"github.com/carsonfarmer/mica/pkg/core"
 )
@@ -22,6 +20,7 @@ type Agent struct {
 	bc         *agentutil.SessionBroadcaster
 	name       string
 	tools      []fantasy.AgentTool
+	commands   map[string]Command
 	cancellers *agentutil.CancellerMap
 }
 
@@ -38,6 +37,15 @@ func WithTools(tools ...fantasy.AgentTool) Option {
 	return func(a *Agent) { a.tools = tools }
 }
 
+// WithCommands sets the agent's slash commands.
+func WithCommands(cmds ...Command) Option {
+	return func(a *Agent) {
+		for _, c := range cmds {
+			a.commands[c.Name] = c
+		}
+	}
+}
+
 // New creates a new Agent.
 func New(reg *core.Registry, store storage.Store[*core.AgentSession], opts ...Option) *Agent {
 	a := &Agent{
@@ -45,6 +53,7 @@ func New(reg *core.Registry, store storage.Store[*core.AgentSession], opts ...Op
 		store:      store,
 		bc:         agentutil.NewSessionBroadcaster(),
 		name:       "mica",
+		commands:   map[string]Command{},
 		cancellers: agentutil.NewCancellerMap(),
 	}
 	for _, o := range opts {
@@ -87,27 +96,10 @@ func (a *Agent) NewSession(ctx context.Context, req *acp.NewSessionRequest, clie
 	if err := a.store.Set(ctx, sid, sess); err != nil {
 		return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
 	}
-
-	// Connect MCP servers eagerly.
-	mgr := acpmcp.NewManager()
-	for i := range req.McpServers {
-		if err := mgr.Connect(ctx, &req.McpServers[i]); err != nil {
-			var name string
-			switch {
-			case req.McpServers[i].Stdio != nil:
-				name = req.McpServers[i].Stdio.Name
-			case req.McpServers[i].HTTP != nil:
-				name = req.McpServers[i].HTTP.Name
-			case req.McpServers[i].SSE != nil:
-				name = req.McpServers[i].SSE.Name
-			}
-			fmt.Printf("mcp connect %s: %v\n", name, err)
-		}
+	stream := agentutil.NewSessionStream(client, sid)
+	if err := stream.SendAvailableCommands(ctx, a.GetAvailableCommands()...); err != nil {
+		return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
 	}
-
-	sess.MCP = mgr
-
-	a.bc.Subscribe(sid, client)
 
 	return &acp.NewSessionResponse{
 		SessionID:     sid,
@@ -119,35 +111,20 @@ func (a *Agent) NewSession(ctx context.Context, req *acp.NewSessionRequest, clie
 
 func (a *Agent) LoadSession(ctx context.Context, req *acp.LoadSessionRequest, client acp.Client) (*acp.LoadSessionResponse, error) {
 	a.bc.Subscribe(req.SessionID, client)
+	stream := agentutil.NewSessionStream(client, req.SessionID)
+	if err := stream.SendAvailableCommands(ctx, a.GetAvailableCommands()...); err != nil {
+		return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
+	}
 
 	sess, _, err := a.store.Get(ctx, req.SessionID)
 	if err != nil {
 		return nil, err
 	}
 
-	mgr := acpmcp.NewManager()
-	for i := range req.McpServers {
-		if err := mgr.Connect(ctx, &req.McpServers[i]); err != nil {
-			var name string
-			switch {
-			case req.McpServers[i].Stdio != nil:
-				name = req.McpServers[i].Stdio.Name
-			case req.McpServers[i].HTTP != nil:
-				name = req.McpServers[i].HTTP.Name
-			case req.McpServers[i].SSE != nil:
-				name = req.McpServers[i].SSE.Name
-			}
-			fmt.Printf("mcp connect %s: %v\n", name, err)
-		}
-	}
-	sess.MCP = mgr
-
 	events, err := a.store.Load(ctx, req.SessionID)
 	if err != nil {
 		return nil, err
 	}
-
-	stream := agentutil.NewSessionStream(client, req.SessionID)
 	for _, upd := range events {
 		if err := stream.SendUpdate(ctx, upd); err != nil {
 			return nil, err
@@ -164,9 +141,6 @@ func (a *Agent) LoadSession(ctx context.Context, req *acp.LoadSessionRequest, cl
 func (a *Agent) CloseSession(_ context.Context, req *acp.CloseSessionRequest, client acp.Client) (*acp.CloseSessionResponse, error) {
 	a.bc.Unsubscribe(req.SessionID, client)
 	a.cancellers.Cancel(req.SessionID)
-	if sess, _, err := a.store.Get(context.Background(), req.SessionID); err == nil && sess.MCP != nil {
-		sess.MCP.Close()
-	}
 	return &acp.CloseSessionResponse{}, nil
 }
 
@@ -175,10 +149,19 @@ func (a *Agent) Cancel(_ context.Context, notif *acp.CancelNotification) error {
 	return nil
 }
 
-func (a *Agent) ListSessions(ctx context.Context, _ *acp.ListSessionsRequest) (*acp.ListSessionsResponse, error) {
+func (a *Agent) ListSessions(ctx context.Context, req *acp.ListSessionsRequest) (*acp.ListSessionsResponse, error) {
 	sessions, err := a.store.List(ctx)
 	if err != nil {
 		return nil, err
+	}
+	if req.CWD != "" {
+		var filtered []acp.SessionInfo
+		for _, s := range sessions {
+			if s.CWD == req.CWD {
+				filtered = append(filtered, s)
+			}
+		}
+		sessions = filtered
 	}
 	return &acp.ListSessionsResponse{Sessions: sessions}, nil
 }
@@ -189,23 +172,6 @@ func (a *Agent) ResumeSession(ctx context.Context, req *acp.ResumeSessionRequest
 	if err != nil {
 		return nil, err
 	}
-
-	mgr := acpmcp.NewManager()
-	for i := range req.McpServers {
-		if err := mgr.Connect(ctx, &req.McpServers[i]); err != nil {
-			var name string
-			switch {
-			case req.McpServers[i].Stdio != nil:
-				name = req.McpServers[i].Stdio.Name
-			case req.McpServers[i].HTTP != nil:
-				name = req.McpServers[i].HTTP.Name
-			case req.McpServers[i].SSE != nil:
-				name = req.McpServers[i].SSE.Name
-			}
-			fmt.Printf("mcp connect %s: %v\n", name, err)
-		}
-	}
-	sess.MCP = mgr
 	return &acp.ResumeSessionResponse{
 		Modes:         a.getSessionModeState(sess),
 		Models:        a.getSessionModelState(sess),
@@ -221,7 +187,7 @@ func (a *Agent) ForkSession(ctx context.Context, req *acp.ForkSessionRequest, cl
 
 	sid := acp.SessionID(acp.NewUUID())
 	sess := &core.AgentSession{
-		SessionInfo:  &acp.SessionInfo{SessionID: sid, CWD: parent.SessionInfo.CWD},
+		SessionInfo:  &acp.SessionInfo{SessionID: sid, CWD: parent.CWD},
 		Model:        parent.Model,
 		ThoughtLevel: parent.ThoughtLevel,
 		Mode:         parent.Mode,

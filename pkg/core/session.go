@@ -6,7 +6,6 @@ import (
 
 	"github.com/carsonfarmer/go-acp-sdk"
 	"github.com/carsonfarmer/go-acp-sdk/agentutil"
-	acpmcp "github.com/carsonfarmer/go-acp-sdk/mcp"
 )
 
 type ctxKey string
@@ -32,7 +31,6 @@ type AgentSession struct {
 	Permissions  agentutil.Permissions `json:"permissions"`
 	Usage        acp.Usage            `json:"usage,omitzero"`
 	Cost         *acp.Cost            `json:"cost,omitempty"`
-	MCP          *acpmcp.Manager      `json:"-"`
 	PromptHooks  []PromptHook         `json:"-"`
 }
 

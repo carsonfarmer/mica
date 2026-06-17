@@ -52,20 +52,7 @@ func MCPTool() fantasy.AgentTool {
 			"  mcp({ server: \"name\", describe: \"t\" }) → Show tool's full parameters\n"+
 			"  mcp({ server: \"name\", tool: \"t\", args: '{\"key\":\"value\"}' }) → Execute\n",
 		func(ctx context.Context, in McpInput, tc fantasy.ToolCall) (fantasy.ToolResponse, error) {
-			sess := core.SessionFrom(ctx)
-			if sess == nil || sess.MCP == nil {
-				return ToolFailedResponse(tc, fmt.Errorf("no MCP manager")), nil
-			}
-			switch {
-			case in.Tool != "":
-				return handleMCPCall(ctx, sess.MCP, in, tc)
-			case in.Describe != "":
-				return handleMCPDescribe(sess.MCP, in, tc)
-			case in.Server != "":
-				return handleMCPList(sess.MCP, in, tc)
-			default:
-				return handleMCPStatus(sess.MCP, tc)
-			}
+			return ToolFailedResponse(tc, fmt.Errorf("MCP not available")), nil
 		},
 	)
 }
