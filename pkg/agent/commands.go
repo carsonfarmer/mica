@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"fmt"
 
 	acp "github.com/carsonfarmer/go-acp-sdk"
 	"github.com/carsonfarmer/go-acp-sdk/agentutil"
@@ -10,17 +11,26 @@ import (
 	"github.com/carsonfarmer/mica/pkg/tools"
 )
 
-// CompactCommand triggers conversation compaction via the compact tool's logic.
+// CompactCommand triggers conversation compaction, streaming the full tool
+// call lifecycle as if the agent itself invoked the compact tool.
 func CompactCommand(store storage.Store[*core.AgentSession], reg *core.Registry) Command {
 	return Command{
 		AvailableCommand: acp.NewAvailableCommand("compact", "Summarize conversation history", "[instructions]"),
 		Execute: func(ctx context.Context, args string) ([]acp.ContentBlock, error) {
-			result, err := tools.Compact(ctx, store, reg, args)
+			sess := core.SessionFrom(ctx)
+			stream := agentutil.NewSessionStream(core.ClientFrom(ctx), sess.SessionID)
+			tcID := acp.ToolCallID(acp.NewUUID())
+			stream.StartToolCall(ctx, tcID, acp.WithTitle("compact"))
+			r, err := tools.Compact(ctx, store, reg, args)
 			if err != nil {
+				stream.FailToolCall(ctx, tcID)
 				return nil, err
 			}
-			sess := core.SessionFrom(ctx)
-			agentutil.NewSessionStream(core.ClientFrom(ctx), sess.SessionID).SendText(ctx, result)
+			stream.UpdateToolCall(ctx, tcID,
+				acp.WithStatus(acp.ToolCompleted),
+				acp.WithTitle(fmt.Sprintf("compact from %d tokens", r.BeforeTokens)),
+				acp.WithRawOutput(r.Summary),
+			)
 			return nil, nil
 		},
 	}

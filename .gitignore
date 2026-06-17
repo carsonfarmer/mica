@@ -17,3 +17,4 @@ Thumbs.db
 
 # Mica runtime data
 .mica/
+.acp/
