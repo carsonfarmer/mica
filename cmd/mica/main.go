@@ -97,6 +97,12 @@ func run(ctx context.Context) error {
 	log.Printf("persisting sessions to %s", absData)
 
 	ag := agent.New(reg, store,
+		agent.WithCommands(
+			agent.CompactCommand(store, reg),
+			agent.TitleCommand(store),
+			agent.InfoCommand(),
+			agent.UsageCommand(),
+		),
 		agent.WithTools(
 			tools.ReadTool(),
 			tools.WriteTool(),
@@ -106,6 +112,7 @@ func run(ctx context.Context) error {
 			tools.CompactTool(store, reg),
 		),
 	)
+	agent.WithCommands(agent.CommandsCommand(ag.GetAvailableCommands))(ag)
 
 	log.Printf("stdio proxy relaying to %s", wsEndpoint)
 	go func() { ws.Proxy(ctx, wsEndpoint) }()

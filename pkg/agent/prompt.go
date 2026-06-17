@@ -25,6 +25,15 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 	ctx = core.WithClient(ctx, client)
 	ctx = core.WithSession(ctx, sess)
 
+	repl, err := a.interceptCommand(ctx, req.Prompt)
+	if err != nil {
+		return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
+	}
+	if repl == nil {
+		return &acp.PromptResponse{StopReason: acp.StopEndTurn}, nil
+	}
+	req.Prompt = repl
+
 	model, err := a.reg.Resolve(ctx, sess.Model)
 	if err != nil {
 		return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
@@ -65,7 +74,7 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 	stream := agentutil.NewSessionStream(a.bc, req.SessionID)
 
 	var sysPrompt strings.Builder
-	fmt.Fprintf(&sysPrompt, SystemPrompt, req.SessionID, sess.SessionInfo.CWD)
+	fmt.Fprintf(&sysPrompt, SystemPrompt, req.SessionID, sess.CWD)
 	for _, h := range sess.PromptHooks {
 		h(&sysPrompt)
 	}
@@ -152,16 +161,18 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 	stopReason := core.FinishReasonToACP(result.Response.FinishReason)
 	usage := core.UsageToACP(result.Response.Usage)
 
-	if len(req.Prompt) > 0 {
-		sess.SessionInfo.Title = agentutil.TitleFromPrompt(req.Prompt)
+	if sess.Title == "" && len(req.Prompt) > 0 {
+		sess.Title = agentutil.TitleFromPrompt(req.Prompt)
 	}
-	if sess.SessionInfo.Title != "" {
+	if sess.Title != "" {
 		a.store.Set(ctx, req.SessionID, sess)
-		upd := acp.UpdateSessionInfo(sess.SessionInfo.Title, time.Now())
+		upd := acp.UpdateSessionInfo(sess.Title, time.Now())
 		if head, err = a.store.Append(ctx, req.SessionID, upd, head); err != nil {
 			return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
 		}
-		stream.SendSessionInfo(ctx, sess.SessionInfo.Title)
+	if err := stream.SendSessionInfo(ctx, sess.Title); err != nil {
+			return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
+		}
 	}
 
 	if usage != nil {
@@ -181,7 +192,9 @@ func (a *Agent) Prompt(ctx context.Context, req *acp.PromptRequest, client acp.C
 		if head, err = a.store.Append(ctx, req.SessionID, upd, head); err != nil {
 			return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
 		}
-		stream.SendUsageUpdate(ctx, sess.Usage.TotalTokens, size, sess.Cost)
+	if err := stream.SendUsageUpdate(ctx, sess.Usage.TotalTokens, size, sess.Cost); err != nil {
+			return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
+		}
 	}
 
 	if head != nil {

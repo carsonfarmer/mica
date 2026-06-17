@@ -26,9 +26,9 @@ func WriteTool() fantasy.AgentTool {
 			if err := CheckPermission(ctx, tc, "write:"+in.Path); err != nil {
 				return ToolErrorResponse(err.Error()), nil
 			}
-			info := core.SessionFrom(ctx).SessionInfo
+			sess := core.SessionFrom(ctx)
 			if _, err := core.ClientFrom(ctx).WriteTextFile(ctx, &acp.WriteTextFileRequest{
-				SessionID: info.SessionID,
+				SessionID: sess.SessionID,
 				Path: in.Path, Content: in.Content,
 			}); err != nil {
 				return ToolFailedResponse(tc, err), nil
@@ -37,7 +37,7 @@ func WriteTool() fantasy.AgentTool {
 			upd := acp.UpdateToolCallDelta(
 				acp.ToolCallID(tc.ID),
 				acp.WithStatus(acp.ToolCompleted),
-				acp.WithTitle("write"+" "+RelPath(info.CWD, in.Path)),
+				acp.WithTitle("write"+" "+RelPath(sess.CWD, in.Path)),
 				acp.WithRawOutput(output),
 				acp.WithRawInput(in),
 				acp.WithLocations(acp.ToolCallLocation{Path: in.Path}),

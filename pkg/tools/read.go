@@ -27,9 +27,9 @@ func ReadTool() fantasy.AgentTool {
 			if err := CheckPermission(ctx, tc, "read:"+filepath.Dir(in.Path)+"/"); err != nil {
 				return ToolErrorResponse(err.Error()), nil
 			}
-			info := core.SessionFrom(ctx).SessionInfo
+			sess := core.SessionFrom(ctx)
 			resp, err := core.ClientFrom(ctx).ReadTextFile(ctx, &acp.ReadTextFileRequest{
-				SessionID: info.SessionID,
+				SessionID: sess.SessionID,
 				Path: in.Path, Line: in.Line, Limit: in.Limit,
 			})
 			if err != nil {
@@ -38,7 +38,7 @@ func ReadTool() fantasy.AgentTool {
 			upd := acp.UpdateToolCallDelta(
 				acp.ToolCallID(tc.ID),
 				acp.WithStatus(acp.ToolCompleted),
-				acp.WithTitle("read"+" "+RelPath(info.CWD, in.Path)),
+				acp.WithTitle("read"+" "+RelPath(sess.CWD, in.Path)),
 				acp.WithRawOutput(resp.Content),
 				acp.WithRawInput(in),
 				acp.WithLocations(acp.ToolCallLocation{Path: in.Path, Line: in.Line}),

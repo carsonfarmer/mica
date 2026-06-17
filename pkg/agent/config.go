@@ -59,14 +59,14 @@ func (a *Agent) setModeConfigOption(ctx context.Context, sess *core.AgentSession
 // returns the new option list.
 func (a *Agent) setConfigOption(ctx context.Context, sess *core.AgentSession, apply func(), extra ...acp.SessionUpdate) (*acp.SetSessionConfigOptionResponse, error) {
 	apply()
-	if err := a.store.Set(ctx, sess.SessionInfo.SessionID, sess); err != nil {
+	if err := a.store.Set(ctx, sess.SessionID, sess); err != nil {
 		return nil, acp.NewRPCError(acp.ErrInternal, err.Error())
 	}
 	opts := a.getSessionConfigOptions(sess)
 	for _, upd := range extra {
-		a.bc.SessionUpdate(ctx, &acp.SessionNotification{SessionID: sess.SessionInfo.SessionID, Update: upd})
+		a.bc.SessionUpdate(ctx, &acp.SessionNotification{SessionID: sess.SessionID, Update: upd})
 	}
-	a.bc.SessionUpdate(ctx, &acp.SessionNotification{SessionID: sess.SessionInfo.SessionID, Update: acp.UpdateConfigOptions(opts...)})
+	a.bc.SessionUpdate(ctx, &acp.SessionNotification{SessionID: sess.SessionID, Update: acp.UpdateConfigOptions(opts...)})
 	return &acp.SetSessionConfigOptionResponse{ConfigOptions: opts}, nil
 }
 

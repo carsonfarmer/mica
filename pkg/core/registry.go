@@ -118,12 +118,7 @@ func (r *Registry) ProviderOptions(mid FullModelID, thoughtLevel string) fantasy
 	case catwalk.TypeOpenAICompat:
 		effort := openai.ReasoningEffort(thoughtLevel)
 		return fantasy.ProviderOptions{
-			openaicompat.Name: &openaicompat.ProviderOptions{
-				ReasoningEffort: &effort,
-				ExtraBody: map[string]any{
-					"interleaved": map[string]string{"field": "reasoning_content"},
-				},
-			},
+			openaicompat.Name: &openaicompat.ProviderOptions{ReasoningEffort: &effort},
 		}
 	case catwalk.TypeAnthropic:
 		effort := anthropic.Effort(thoughtLevel)

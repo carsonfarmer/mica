@@ -31,9 +31,9 @@ func TerminalTool() fantasy.AgentTool {
 			if !ok {
 				return ToolFailedResponse(tc, fmt.Errorf("terminal capability not available")), nil
 			}
-			info := core.SessionFrom(ctx).SessionInfo
+			sess := core.SessionFrom(ctx)
 			handle, err := agentutil.CreateTerminalHandle(ctx, client, &acp.CreateTerminalRequest{
-				SessionID: info.SessionID,
+				SessionID: sess.SessionID,
 				Command:   in.Command,
 				Args:      in.Args,
 				CWD:       in.Cwd,
@@ -43,7 +43,7 @@ func TerminalTool() fantasy.AgentTool {
 			}
 			defer handle.Release(ctx)
 
-			stream := agentutil.NewSessionStream(core.ClientFrom(ctx), info.SessionID)
+			stream := agentutil.NewSessionStream(core.ClientFrom(ctx), sess.SessionID)
 			title := strings.TrimSpace(in.Command + " " + strings.Join(in.Args, " "))
 			stream.SendUpdate(ctx, acp.UpdateToolCallDelta(
 				acp.ToolCallID(tc.ID),
@@ -88,7 +88,7 @@ func TerminalCreateTool() fantasy.AgentTool {
 				return ToolFailedResponse(tc, fmt.Errorf("terminal capability not available")), nil
 			}
 			if resp, err := terminal.CreateTerminal(ctx, &acp.CreateTerminalRequest{
-				SessionID: core.SessionFrom(ctx).SessionInfo.SessionID,
+				SessionID: core.SessionFrom(ctx).SessionID,
 				Command:   in.Command,
 				Args:      in.Args,
 				CWD:       in.Cwd,
@@ -122,7 +122,7 @@ func TerminalOutputTool() fantasy.AgentTool {
 				return ToolFailedResponse(tc, fmt.Errorf("terminal capability not available")), nil
 			}
 			if out, err := terminal.TerminalOutput(ctx, &acp.TerminalOutputRequest{
-				SessionID:  core.SessionFrom(ctx).SessionInfo.SessionID,
+				SessionID:  core.SessionFrom(ctx).SessionID,
 				TerminalID: in.TerminalID,
 			}); err != nil {
 				return ToolFailedResponse(tc, err), nil
@@ -160,7 +160,7 @@ func TerminalWaitTool() fantasy.AgentTool {
 				return ToolFailedResponse(tc, fmt.Errorf("terminal capability not available")), nil
 			}
 			if exit, err := terminal.WaitForTerminalExit(ctx, &acp.WaitForTerminalExitRequest{
-				SessionID:  core.SessionFrom(ctx).SessionInfo.SessionID,
+				SessionID:  core.SessionFrom(ctx).SessionID,
 				TerminalID: in.TerminalID,
 			}); err != nil {
 				return ToolFailedResponse(tc, err), nil
@@ -192,7 +192,7 @@ func TerminalKillTool() fantasy.AgentTool {
 				return ToolFailedResponse(tc, fmt.Errorf("terminal capability not available")), nil
 			}
 			if _, err := terminal.KillTerminal(ctx, &acp.KillTerminalRequest{
-				SessionID:  core.SessionFrom(ctx).SessionInfo.SessionID,
+				SessionID:  core.SessionFrom(ctx).SessionID,
 				TerminalID: in.TerminalID,
 			}); err != nil {
 				return ToolFailedResponse(tc, err), nil
@@ -218,7 +218,7 @@ func TerminalReleaseTool() fantasy.AgentTool {
 				return ToolFailedResponse(tc, fmt.Errorf("terminal capability not available")), nil
 			}
 			if _, err := terminal.ReleaseTerminal(ctx, &acp.ReleaseTerminalRequest{
-				SessionID:  core.SessionFrom(ctx).SessionInfo.SessionID,
+				SessionID:  core.SessionFrom(ctx).SessionID,
 				TerminalID: in.TerminalID,
 			}); err != nil {
 				return ToolFailedResponse(tc, err), nil

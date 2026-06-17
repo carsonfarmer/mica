@@ -38,10 +38,10 @@ func EditTool() fantasy.AgentTool {
 			if err := CheckPermission(ctx, tc, "edit:"+in.Path); err != nil {
 				return ToolErrorResponse(err.Error()), nil
 			}
-			info := core.SessionFrom(ctx).SessionInfo
+			sess := core.SessionFrom(ctx)
 			var oldContent string
 			if resp, err := core.ClientFrom(ctx).ReadTextFile(ctx, &acp.ReadTextFileRequest{
-				SessionID: info.SessionID, Path: in.Path,
+				SessionID: sess.SessionID, Path: in.Path,
 			}); err == nil {
 				oldContent = resp.Content
 			}
@@ -50,7 +50,7 @@ func EditTool() fantasy.AgentTool {
 				return ToolFailedResponse(tc, err), nil
 			}
 			if _, err = core.ClientFrom(ctx).WriteTextFile(ctx, &acp.WriteTextFileRequest{
-				SessionID: info.SessionID, Path: in.Path, Content: newContent,
+				SessionID: sess.SessionID, Path: in.Path, Content: newContent,
 			}); err != nil {
 				return ToolFailedResponse(tc, err), nil
 			}
@@ -58,7 +58,7 @@ func EditTool() fantasy.AgentTool {
 			upd := acp.UpdateToolCallDelta(
 				acp.ToolCallID(tc.ID),
 				acp.WithStatus(acp.ToolCompleted),
-				acp.WithTitle("edit"+" "+RelPath(info.CWD, in.Path)),
+				acp.WithTitle("edit"+" "+RelPath(sess.CWD, in.Path)),
 				acp.WithRawOutput(output),
 				acp.WithRawInput(in),
 				acp.WithLocations(acp.ToolCallLocation{Path: in.Path}),

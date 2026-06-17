@@ -30,7 +30,7 @@ func CheckPermission(ctx context.Context, tc fantasy.ToolCall, target string) er
 	client := core.ClientFrom(ctx)
 	kind := core.ToolNameToACP(tc.Name)
 	resp, err := client.RequestPermission(ctx, &acp.RequestPermissionRequest{
-		SessionID: s.SessionInfo.SessionID,
+		SessionID: s.SessionID,
 		ToolCall: acp.ToolCallUpdate{
 			ToolCallID: acp.ToolCallID(tc.ID),
 			Title:      tc.Name + " " + strings.TrimPrefix(target, tc.Name+":"),
